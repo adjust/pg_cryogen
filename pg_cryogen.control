@@ -1,0 +1,4 @@
+comment = 'compressed heap tuple storage'
+default_version = '0.1'
+module_pathname = '$libdir/pg_cryogen'
+relocatable = true
