@@ -1,5 +1,5 @@
 MODULE_big = pg_cryogen
-OBJS = storage.o pg_cryogen.o 
+OBJS = pg_cryogen.o 
 PGFILEDESC = "pg_cryogen - append-only compressed storage"
 
 SHLIB_LINK = -llz4

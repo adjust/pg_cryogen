@@ -1,0 +1,6 @@
+CREATE FUNCTION cryo_tableam_handler(INTERNAL) RETURNS table_am_handler
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE ACCESS METHOD pg_cryogen
+TYPE TABLE
+HANDLER cryo_tableam_handler;
