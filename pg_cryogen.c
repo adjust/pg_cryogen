@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "access/generic_xlog.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
@@ -11,12 +12,20 @@
 #include "commands/vacuum.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
+#include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
+#include "lz4.h"
+
+#include "storage.h"
+
 
 PG_MODULE_MAGIC;
+
+#define CRYO_META_PAGE 0
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 
 typedef struct CryoScanDescData
@@ -26,7 +35,31 @@ typedef struct CryoScanDescData
 typedef CryoScanDescData *CryoScanDesc;
 
 
+typedef struct CryoModifyState
+{
+    bool        initialized;
+    Relation    relation;
+    BlockNumber target_block;
+    Buffer      metabuf;
+    //GenericXLogState   *xlog_state;
+    char        data[CRYO_BLCKSZ];  /* decompressed block */
+} CryoModifyState;
+
+CryoModifyState modifyState;
+
+
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
+
+void _PG_init(void);
+
+void
+_PG_init(void)
+{
+    modifyState.initialized = false;
+    /*
+    modifyState.data = palloc0(CRYO_BLCKSZ);
+    */
+}
 
 static const TupleTableSlotOps *
 cryo_slot_callbacks(Relation relation)
@@ -141,11 +174,47 @@ cryo_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
     elog(ERROR, "not implemented");
 }
 
+static Buffer
+cryo_load_meta(Relation rel)
+{
+    Buffer          metabuf;
+    CryoMetaPage   *metapage;
+
+    if (RelationGetNumberOfBlocks(rel) == 0)
+    {
+        GenericXLogState *xlogState = GenericXLogStart(rel);
+
+        /* This is a brand new relation. Initialize a metapage */
+        metabuf = ReadBuffer(rel, P_NEW);
+        LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+        metapage = (CryoMetaPage *)
+            GenericXLogRegisterBuffer(xlogState, metabuf,
+                                      GENERIC_XLOG_FULL_IMAGE);
+        metapage->target_block = 0;     /* no target block yet */
+        GenericXLogFinish(xlogState);
+        UnlockReleaseBuffer(metabuf);
+        //MarkBufferDirty(metabuf); -- done automatically by GenericXLogFinish()
+    }
+
+    metabuf = ReadBuffer(rel, CRYO_META_PAGE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+    LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+    modifyState.target_block = metapage->target_block;
+
+    return metabuf;
+}
+
 static void
 cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
-                    int options, BulkInsertState bistate)
+                  int options, BulkInsertState bistate)
 {
     elog(ERROR, "not implemented");
+}
+
+static void
+cryo_finish_bulk_insert(Relation rel, int options)
+{
+    modifyState.initialized = false;
 }
 
 static void
@@ -163,11 +232,128 @@ cryo_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
     elog(ERROR, "not implemented");
 }
 
+static char *
+cryo_compress(CryoModifyState *state, Size *size)
+{
+    Size    estimate;
+    char   *compressed;
+
+    estimate = LZ4_compressBound(CRYO_BLCKSZ);
+    compressed = palloc(estimate);
+
+    *size = LZ4_compress_fast(state->data, compressed, CRYO_BLCKSZ, estimate, 0);
+    if (*size == 0)
+        elog(ERROR, "pg_cryogen: compression failed");
+
+    return compressed;
+}
+
+static void
+cryo_preserve(CryoModifyState *state)
+{
+    Size    size;
+    char   *compressed;
+    Size    page_content_size = BLCKSZ - sizeof(CryoPageHeader);
+    int     npages;
+    Buffer *buffers;
+    int     i;
+    GenericXLogState *xlog_state;
+    CryoMetaPage   *metapage;
+
+    compressed = cryo_compress(state, &size);
+
+    /* split data into pages */
+    npages = (size + page_content_size - 1) / page_content_size; /* round up */
+    buffers = palloc(npages * sizeof(Buffer));
+
+    if (state->target_block == 0)
+        state->target_block = 1;
+
+    for (i = 0; i < npages; ++i)
+    {
+        /*buffers[i] = ReadBuffer(state->relation, state->target_block + i);
+        if (BufferIsInvalid(buffers[i]))*/
+            buffers[i] = ReadBuffer(state->relation, P_NEW);
+        LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
+    }
+
+    xlog_state = GenericXLogStart(modifyState.relation);
+    for (i = 0; i < npages; ++i)
+    {
+        CryoPageHeader *hdr;
+
+        //hdr = (CryoPageHeader *) BufferGetPage(buffers[i]);
+        hdr = (CryoPageHeader *)
+            GenericXLogRegisterBuffer(xlog_state, buffers[i],
+                                      GENERIC_XLOG_FULL_IMAGE);
+        hdr->npages = npages;
+        hdr->curpage = i;
+        hdr->base.pd_checksum = 0; /* TODO */
+        memcpy(hdr + 1, compressed, MIN(page_content_size, size));
+
+        size -= page_content_size;
+
+        MarkBufferDirty(buffers[i]);
+        /* TODO: write WAL */
+    }
+
+    /* update metadata */
+    metapage = (CryoMetaPage *)
+        GenericXLogRegisterBuffer(xlog_state, modifyState.metabuf,
+                                  GENERIC_XLOG_FULL_IMAGE);
+    metapage->target_block = modifyState.target_block;
+    GenericXLogFinish(xlog_state);
+
+    /* Release all affected buffers */
+    for (i = 0; i < npages; ++i)
+        UnlockReleaseBuffer(buffers[i]);
+    UnlockReleaseBuffer(modifyState.metabuf);
+
+    state->target_block = i;
+}
+
 static void
 cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                   CommandId cid, int options, BulkInsertState bistate)
 {
-    elog(ERROR, "not implemented");
+    CryoDataHeader *hdr;
+    int             i;
+
+    /* initialize modify state */
+    modifyState.metabuf = cryo_load_meta(relation);
+    if (modifyState.target_block == 0)
+    {
+        /* This is a new block */
+        memset(modifyState.data, 0, CRYO_BLCKSZ);
+    }
+    else
+    {
+        /* TODO: read the target block contents into modifyState.data */
+        memset(modifyState.data, 0, CRYO_BLCKSZ);
+    }
+    modifyState.relation = relation;
+    modifyState.initialized = true;
+    //modifyState.xlog_state = GenericXLogStart(relation);
+
+    hdr = (CryoDataHeader *) modifyState.data;
+    /* TODO: read existing block from buffers */
+    cryo_init_page(hdr);
+    for (i = 0; i < ntuples; ++i)
+    {
+        HeapTuple       tuple;
+
+        tuple = ExecCopySlotHeapTuple(slots[i]);
+        if (!cryo_storage_insert(hdr, tuple))
+        {
+            /* 
+             * TODO: compress and flush current block to the disk and create a
+             * new one.
+             */
+            //elog(ERROR, "Not enough space");
+            cryo_preserve(&modifyState);
+        }
+    }
+    cryo_preserve(&modifyState);
 }
 
 static TM_Result
@@ -315,7 +501,21 @@ cryo_index_validate_scan(Relation relation,
 static uint64
 cryo_relation_size(Relation rel, ForkNumber forkNumber)
 {
-    elog(ERROR, "not implemented");
+	uint64		nblocks = 0;
+
+	/* Open it at the smgr level if not already done */
+	RelationOpenSmgr(rel);
+
+	/* InvalidForkNumber indicates returning the size for all forks */
+	if (forkNumber == InvalidForkNumber)
+	{
+		for (int i = 0; i < MAX_FORKNUM; i++)
+			nblocks += smgrnblocks(rel->rd_smgr, i);
+	}
+	else
+		nblocks = smgrnblocks(rel->rd_smgr, forkNumber);
+
+	return nblocks * BLCKSZ;
 }
 
 static bool
@@ -378,6 +578,7 @@ static const TableAmRoutine cryo_methods =
     .index_fetch_tuple = cryo_index_fetch_tuple,
 
     .tuple_insert = cryo_tuple_insert,
+    .finish_bulk_insert = cryo_finish_bulk_insert,
     .tuple_insert_speculative = cryo_tuple_insert_speculative,
     .tuple_complete_speculative = cryo_tuple_complete_speculative,
     .multi_insert = cryo_multi_insert,
