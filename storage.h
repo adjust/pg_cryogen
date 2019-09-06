@@ -10,7 +10,9 @@
 
 typedef struct
 {
-    uint32  target_block;
+    PageHeaderData base;    /* to keep PageIsVerified quiet */
+    uint32  target_block;   /* the last block we inserted to;
+                             * zero if we haven't yet */
 } CryoMetaPage;
 
 /*

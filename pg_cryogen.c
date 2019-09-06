@@ -26,6 +26,7 @@ PG_MODULE_MAGIC;
 
 #define CRYO_META_PAGE 0
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 
 typedef struct CryoScanDescData
@@ -40,9 +41,9 @@ typedef CryoScanDescData *CryoScanDesc;
 
 typedef struct CryoModifyState
 {
-    bool        initialized;
     Relation    relation;
     BlockNumber target_block;
+    bool        modified;
     Buffer      metabuf;
     char        data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoModifyState;
@@ -57,7 +58,6 @@ void _PG_init(void);
 void
 _PG_init(void)
 {
-    modifyState.initialized = false;
     /*
     modifyState.data = palloc0(CRYO_BLCKSZ);
     */
@@ -289,7 +289,18 @@ cryo_load_meta(Relation rel)
         metapage = (CryoMetaPage *)
             GenericXLogRegisterBuffer(xlogState, metabuf,
                                       GENERIC_XLOG_FULL_IMAGE);
-        metapage->target_block = 0;     /* no target block yet */
+
+        /*
+         * Can't leave pd_upper = 0 because then page will be considered new
+         * (see PageIsNew) and won't pass PageIsVerified check
+         */
+        metapage->base.pd_upper = sizeof(CryoPageHeader);
+        metapage->base.pd_lower = metapage->base.pd_upper;
+        metapage->base.pd_special = BLCKSZ;
+
+        /* No target block yet */
+        metapage->target_block = 0;
+
         GenericXLogFinish(xlogState);
         UnlockReleaseBuffer(metabuf);
         //MarkBufferDirty(metabuf); -- done automatically by GenericXLogFinish()
@@ -313,7 +324,7 @@ cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 static void
 cryo_finish_bulk_insert(Relation rel, int options)
 {
-    modifyState.initialized = false;
+    modifyState.modified = false;
 }
 
 static void
@@ -331,17 +342,24 @@ cryo_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
     elog(ERROR, "not implemented");
 }
 
+/*
+ * Compress and store data in postgres buffers, write WAL and all that stuff.
+ * If advance flag is set true, then also shift target_block of the state to
+ * the next block after the last written page.
+ */
 static void
-cryo_preserve(CryoModifyState *state)
+cryo_preserve(CryoModifyState *state, bool advance)
 {
-    Size    size;
-    char   *compressed;
-    Size    page_content_size = BLCKSZ - sizeof(CryoPageHeader);
-    int     npages;
-    Buffer *buffers;
-    int     i;
-    GenericXLogState *xlog_state;
-    CryoMetaPage   *metapage;
+    GenericXLogState   *xlog_state;
+    CryoMetaPage       *metapage;
+    Relation    rel = state->relation;
+    Size        size;
+    char       *compressed;
+    Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
+    int         npages;
+    Buffer     *buffers;
+    int         i;
+    BlockNumber block = state->target_block;
 
     compressed = cryo_compress(state->data, &size);
 
@@ -349,23 +367,23 @@ cryo_preserve(CryoModifyState *state)
     npages = (size + page_content_size - 1) / page_content_size; /* round up */
     buffers = palloc(npages * sizeof(Buffer));
 
-    if (state->target_block == 0)
-        state->target_block = 1;
+    block = MAX(1, block);
 
     for (i = 0; i < npages; ++i)
     {
-        /*buffers[i] = ReadBuffer(state->relation, state->target_block + i);
-        if (BufferIsInvalid(buffers[i]))*/
-            buffers[i] = ReadBuffer(state->relation, P_NEW);
+        /* read buffer or create new blocks if they are not there */
+        if (RelationGetNumberOfBlocks(rel) > block)
+            buffers[i] = ReadBuffer(rel, block + i);
+        else
+            buffers[i] = ReadBuffer(rel, P_NEW);
         LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
     }
 
-    xlog_state = GenericXLogStart(modifyState.relation);
+    xlog_state = GenericXLogStart(state->relation);
     for (i = 0; i < npages; ++i)
     {
         CryoPageHeader *hdr;
 
-        //hdr = (CryoPageHeader *) BufferGetPage(buffers[i]);
         hdr = (CryoPageHeader *)
             GenericXLogRegisterBuffer(xlog_state, buffers[i],
                                       GENERIC_XLOG_FULL_IMAGE);
@@ -391,17 +409,18 @@ cryo_preserve(CryoModifyState *state)
 
     /* update metadata */
     metapage = (CryoMetaPage *)
-        GenericXLogRegisterBuffer(xlog_state, modifyState.metabuf,
+        GenericXLogRegisterBuffer(xlog_state, state->metabuf,
                                   GENERIC_XLOG_FULL_IMAGE);
-    metapage->target_block = modifyState.target_block;
+    metapage->target_block = state->target_block = block;
     GenericXLogFinish(xlog_state);
 
     /* Release all affected buffers */
     for (i = 0; i < npages; ++i)
         UnlockReleaseBuffer(buffers[i]);
-    UnlockReleaseBuffer(modifyState.metabuf);
+    UnlockReleaseBuffer(state->metabuf);
 
-    state->target_block = i;
+    if (advance)
+        state->target_block = i;
 }
 
 static void
@@ -411,25 +430,24 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     CryoDataHeader *hdr;
     int             i;
 
+    hdr = (CryoDataHeader *) modifyState.data;
+
     /* initialize modify state */
     modifyState.metabuf = cryo_load_meta(relation);
     if (modifyState.target_block == 0)
     {
         /* This is a new block */
         memset(modifyState.data, 0, CRYO_BLCKSZ);
+        cryo_init_page(hdr);
     }
     else
     {
-        /* TODO: read the target block contents into modifyState.data */
-        memset(modifyState.data, 0, CRYO_BLCKSZ);
+        /* Read the target block contents into modifyState.data */
+        cryo_read_data(relation, modifyState.target_block, modifyState.data);
     }
     modifyState.relation = relation;
-    modifyState.initialized = true;
-    //modifyState.xlog_state = GenericXLogStart(relation);
+    modifyState.modified = false;
 
-    hdr = (CryoDataHeader *) modifyState.data;
-    /* TODO: read existing block from buffers */
-    cryo_init_page(hdr);
     for (i = 0; i < ntuples; ++i)
     {
         HeapTuple       tuple;
@@ -438,14 +456,23 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
         if (!cryo_storage_insert(hdr, tuple))
         {
             /* 
-             * TODO: compress and flush current block to the disk and create a
-             * new one.
+             * Compress and flush current block to the disk (if needed),
+             * create a new one and retry insertion
              */
-            //elog(ERROR, "Not enough space");
-            cryo_preserve(&modifyState);
+            if (modifyState.modified)
+            {
+                cryo_preserve(&modifyState, true);
+                modifyState.modified = false;
+            }
+            cryo_init_page(hdr);
+            if (!cryo_storage_insert(hdr, tuple))
+            {
+                elog(ERROR, "tuple is too large to fit the cryo block");
+            }
         }
+        modifyState.modified = true;
     }
-    cryo_preserve(&modifyState);
+    cryo_preserve(&modifyState, false);
 }
 
 static TM_Result
