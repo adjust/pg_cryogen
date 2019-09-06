@@ -22,13 +22,13 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
 
     /* insert tuple */
     d->upper -= MAXALIGN(tuple->t_len);
-    memcpy(d->data + d->upper, tuple->t_data, tuple->t_len);
+    memcpy((char *) d + d->upper, tuple->t_data, tuple->t_len);
 
     /* insert item id pointing to the tuple */
     itemId.off = d->upper;
     itemId.len = tuple->t_len;
-    memcpy(d->data + d->lower, &itemId, sizeof(ItemId));
-    d->lower += MAXALIGN(sizeof(ItemId));
+    memcpy((char *) d + d->lower, &itemId, sizeof(ItemId));
+    d->lower += sizeof(ItemId);
 
     return true;
 }

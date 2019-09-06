@@ -24,6 +24,7 @@ typedef struct
                              * GenericXLogFinish() */
     uint16  npages;         /* number of pages for this cryo block */
     uint16  curpage;
+    uint32  compressed_size;
 } CryoPageHeader;
 
 /* */

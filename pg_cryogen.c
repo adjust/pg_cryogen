@@ -31,6 +31,9 @@ PG_MODULE_MAGIC;
 typedef struct CryoScanDescData
 {
     TableScanDescData   rs_base;
+    BlockNumber         cur_block;
+    uint32              cur_item;
+    char                data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoScanDescData;
 typedef CryoScanDescData *CryoScanDesc;
 
@@ -41,8 +44,7 @@ typedef struct CryoModifyState
     Relation    relation;
     BlockNumber target_block;
     Buffer      metabuf;
-    //GenericXLogState   *xlog_state;
-    char        data[CRYO_BLCKSZ];  /* decompressed block */
+    char        data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoModifyState;
 
 CryoModifyState modifyState;
@@ -64,7 +66,78 @@ _PG_init(void)
 static const TupleTableSlotOps *
 cryo_slot_callbacks(Relation relation)
 {
-    return &TTSOpsBufferHeapTuple;
+//    return &TTSOpsBufferHeapTuple;
+    return &TTSOpsHeapTuple;
+}
+
+static char *
+cryo_compress(const char *data, Size *compressed_size)
+{
+    Size    estimate;
+    char   *compressed;
+
+    estimate = LZ4_compressBound(CRYO_BLCKSZ);
+    compressed = palloc(estimate);
+
+    *compressed_size = LZ4_compress_fast(data, compressed,
+                                         CRYO_BLCKSZ, estimate, 0);
+    if (*compressed_size == 0)
+        elog(ERROR, "pg_cryogen: compression failed");
+
+    return compressed;
+}
+
+/*
+ * Decompress and store result in `out`
+ */
+static void
+cryo_decompress(const char *compressed, Size compressed_size, char *out)
+{
+    int bytes;
+
+    bytes = LZ4_decompress_safe(compressed, out, compressed_size, CRYO_BLCKSZ);
+    if (bytes < 0)
+        elog(ERROR, "pg_cryogen: decompression failed");
+
+    Assert(CRYO_BLCKSZ == bytes);
+}
+
+/*
+ * Read and reassemble compressed data from the buffer manager starting
+ * with `block` and decompress it.
+ */
+static void
+cryo_read_data(Relation rel, BlockNumber block, char *out)
+{
+    Buffer      buf;
+    CryoPageHeader *page;
+    char       *compressed, *p;
+    Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
+    Size        compressed_size, size;
+
+    buf = ReadBuffer(rel, block);
+    page = (CryoPageHeader *) BufferGetPage(buf);
+    size = compressed_size = page->compressed_size;
+    p = compressed = palloc(compressed_size);
+
+    while (true)
+    {
+        Size    l = MIN(page_content_size, size);
+        char   *page_content = ((char *) page) + sizeof(CryoPageHeader);
+
+        memcpy(p, page_content, l);
+        p += l;
+        size -= l;
+        ReleaseBuffer(buf);
+
+        if (size == 0)
+            break;
+
+        /* read the next block */
+        buf = ReadBuffer(rel, ++block);
+    }
+
+    cryo_decompress(compressed, compressed_size, out);
 }
 
 static TableScanDesc
@@ -86,6 +159,10 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->rs_base.rs_snapshot = snapshot;
     scan->rs_base.rs_nkeys = nkeys;
     scan->rs_base.rs_flags = flags;
+    scan->cur_item = 0;
+    scan->cur_block = 1;
+
+    cryo_read_data(relation, scan->cur_block, scan->data);
 
     return (TableScanDesc) scan;
 }
@@ -93,7 +170,27 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
 static bool
 cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
+    CryoScanDesc scan = (CryoScanDesc) sscan;
+    CryoDataHeader *hdr = (CryoDataHeader *) scan->data;
+
     ExecClearTuple(slot);
+
+    if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
+    {
+        /* read tuple */
+        CryoItemId *item = (CryoItemId *) hdr->data + scan->cur_item;
+        HeapTuple tuple;
+
+        tuple = palloc0(sizeof(HeapTupleData));
+        tuple->t_len = item->len;
+        tuple->t_data = (HeapTupleHeader) (scan->data + item->off);
+
+        ExecStoreHeapTuple(tuple, slot, false);
+
+        scan->cur_item++;
+
+        return true;
+    }
 
     return false;
 }
@@ -115,8 +212,10 @@ cryo_endscan(TableScanDesc sscan)
      */
     RelationDecrementReferenceCount(scan->rs_base.rs_rd);
 
+    /*
     if (scan->rs_base.rs_key)
         pfree(scan->rs_base.rs_key);
+    */
 
     if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
         UnregisterSnapshot(scan->rs_base.rs_snapshot);
@@ -232,22 +331,6 @@ cryo_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
     elog(ERROR, "not implemented");
 }
 
-static char *
-cryo_compress(CryoModifyState *state, Size *size)
-{
-    Size    estimate;
-    char   *compressed;
-
-    estimate = LZ4_compressBound(CRYO_BLCKSZ);
-    compressed = palloc(estimate);
-
-    *size = LZ4_compress_fast(state->data, compressed, CRYO_BLCKSZ, estimate, 0);
-    if (*size == 0)
-        elog(ERROR, "pg_cryogen: compression failed");
-
-    return compressed;
-}
-
 static void
 cryo_preserve(CryoModifyState *state)
 {
@@ -260,7 +343,7 @@ cryo_preserve(CryoModifyState *state)
     GenericXLogState *xlog_state;
     CryoMetaPage   *metapage;
 
-    compressed = cryo_compress(state, &size);
+    compressed = cryo_compress(state->data, &size);
 
     /* split data into pages */
     npages = (size + page_content_size - 1) / page_content_size; /* round up */
@@ -288,8 +371,17 @@ cryo_preserve(CryoModifyState *state)
                                       GENERIC_XLOG_FULL_IMAGE);
         hdr->npages = npages;
         hdr->curpage = i;
+        hdr->compressed_size = size;
         hdr->base.pd_checksum = 0; /* TODO */
-        memcpy(hdr + 1, compressed, MIN(page_content_size, size));
+        /*
+         * Can't leave pd_upper = 0 because then page will be considered new
+         * (see PageIsNew) and won't pass PageIsVerified check
+         */
+        hdr->base.pd_upper = hdr->base.pd_lower = sizeof(CryoPageHeader);
+        hdr->base.pd_special = BLCKSZ;
+        memcpy((char *) hdr + sizeof(CryoPageHeader),
+               compressed,
+               MIN(page_content_size, size));
 
         size -= page_content_size;
 
