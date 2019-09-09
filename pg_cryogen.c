@@ -32,6 +32,7 @@ PG_MODULE_MAGIC;
 typedef struct CryoScanDescData
 {
     TableScanDescData   rs_base;
+    uint32              nblocks;
     BlockNumber         cur_block;
     uint32              cur_item;
     char                data[CRYO_BLCKSZ];  /* decompressed data */
@@ -107,7 +108,7 @@ cryo_decompress(const char *compressed, Size compressed_size, char *out)
  * with `block` and decompress it.
  */
 static void
-cryo_read_data(Relation rel, BlockNumber block, char *out)
+cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
 {
     Buffer      buf;
     CryoPageHeader *page;
@@ -119,6 +120,8 @@ cryo_read_data(Relation rel, BlockNumber block, char *out)
     page = (CryoPageHeader *) BufferGetPage(buf);
     size = compressed_size = page->compressed_size;
     p = compressed = palloc(compressed_size);
+    if (nblocks)
+        *nblocks = 1;
 
     while (true)
     {
@@ -136,6 +139,9 @@ cryo_read_data(Relation rel, BlockNumber block, char *out)
         /* read the next block */
         buf = ReadBuffer(rel, ++block);
         page = (CryoPageHeader *) BufferGetPage(buf);
+
+        if (nblocks)
+            (*nblocks)++;
     }
 
     cryo_decompress(compressed, compressed_size, out);
@@ -163,7 +169,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->cur_item = 0;
     scan->cur_block = 1;
 
-    cryo_read_data(relation, scan->cur_block, scan->data);
+    cryo_read_data(relation, scan->cur_block, &scan->nblocks, scan->data);
 
     return (TableScanDesc) scan;
 }
@@ -176,6 +182,7 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
 
     ExecClearTuple(slot);
 
+read_tuple:
     if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
     {
         /* read tuple */
@@ -191,6 +198,18 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
         scan->cur_item++;
 
         return true;
+    }
+    else
+    {
+        Relation rel = scan->rs_base.rs_rd;
+
+        scan->cur_block += scan->nblocks;
+        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
+            return false;
+
+        cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        scan->cur_item = 0;
+        goto read_tuple;
     }
 
     return false;
@@ -434,13 +453,12 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     if (modifyState.target_block == 0)
     {
         /* This is a new block */
-        memset(modifyState.data, 0, CRYO_BLCKSZ);
         cryo_init_page(hdr);
     }
     else
     {
         /* Read the target block contents into modifyState.data */
-        cryo_read_data(relation, modifyState.target_block, modifyState.data);
+        cryo_read_data(relation, modifyState.target_block, NULL, modifyState.data);
     }
     modifyState.relation = relation;
     modifyState.modified = false;

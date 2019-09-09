@@ -4,6 +4,7 @@
 void
 cryo_init_page(CryoDataHeader *hdr)
 {
+    memset(hdr, 0, CRYO_BLCKSZ);
     hdr->lower = CryoDataHeaderSize;
     hdr->upper = CRYO_BLCKSZ;
 }
