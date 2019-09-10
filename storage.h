@@ -6,7 +6,8 @@
 #include "storage/bufpage.h"
 
 
-#define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
+//#define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
+#define CRYO_BLCKSZ (1 << 16)   /* 1Mb */
 
 typedef struct
 {
@@ -47,7 +48,7 @@ typedef struct
 
 
 void cryo_init_page(CryoDataHeader *hdr);
-bool cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple);
+int cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple);
 
 
 #endif /* __STORAGE_H__ */

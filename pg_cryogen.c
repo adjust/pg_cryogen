@@ -10,9 +10,12 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
@@ -27,6 +30,10 @@ PG_MODULE_MAGIC;
 #define CRYO_META_PAGE 0
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define NOT_IMPLEMENTED \
+    do { \
+        elog(ERROR, "function \"%s\" is not implemented", __func__); \
+    } while (0)
 
 
 typedef struct CryoScanDescData
@@ -116,6 +123,14 @@ cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
     Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
     Size        compressed_size, size;
 
+    /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
+    if (RelationGetNumberOfBlocks(rel) <= block)
+    {
+        cryo_init_page((CryoDataHeader *) out);
+        *nblocks = 0;
+        return;
+    }
+
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
     size = compressed_size = page->compressed_size;
@@ -204,6 +219,7 @@ read_tuple:
         Relation rel = scan->rs_base.rs_rd;
 
         scan->cur_block += scan->nblocks;
+        /* TODO: use metapage->target_block instead of number of blocks */
         if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
             return false;
 
@@ -219,7 +235,7 @@ static void
 cryo_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
@@ -246,19 +262,19 @@ cryo_endscan(TableScanDesc sscan)
 static IndexFetchTableData *
 cryo_index_fetch_begin(Relation rel)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
 cryo_index_fetch_reset(IndexFetchTableData *scan)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
 cryo_index_fetch_end(IndexFetchTableData *scan)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
@@ -268,7 +284,7 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                          TupleTableSlot *slot,
                          bool *call_again, bool *all_dead)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
@@ -277,20 +293,20 @@ cryo_fetch_row_version(Relation relation,
                          Snapshot snapshot,
                          TupleTableSlot *slot)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
 cryo_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
 cryo_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
                                 Snapshot snapshot)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static Buffer
@@ -338,7 +354,7 @@ static void
 cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
                   int options, BulkInsertState bistate)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
@@ -346,14 +362,14 @@ cryo_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
                                 CommandId cid, int options,
                                 BulkInsertState bistate, uint32 specToken)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
 cryo_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
                                   uint32 specToken, bool succeeded)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 /*
@@ -457,6 +473,12 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     }
     else
     {
+        /* 
+         * TODO: in order to ensure that storage is  consistent its better
+         * to create entirely new block instead of adding tuples to an
+         * existing one
+         */
+
         /* Read the target block contents into modifyState.data */
         cryo_read_data(relation, modifyState.target_block, NULL, modifyState.data);
     }
@@ -465,10 +487,11 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
     for (i = 0; i < ntuples; ++i)
     {
-        HeapTuple       tuple;
+        HeapTuple   tuple;
+        int         pos;
 
         tuple = ExecCopySlotHeapTuple(slots[i]);
-        if (!cryo_storage_insert(hdr, tuple))
+        if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
         {
             /* 
              * Compress and flush current block to the disk (if needed),
@@ -480,12 +503,15 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                 modifyState.modified = false;
             }
             cryo_init_page(hdr);
-            if (!cryo_storage_insert(hdr, tuple))
+            if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
             {
                 elog(ERROR, "tuple is too large to fit the cryo block");
             }
         }
         modifyState.modified = true;
+
+        slots[i]->tts_tableOid = RelationGetRelid(relation);
+        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
     }
     cryo_preserve(&modifyState, false);
 }
@@ -520,7 +546,22 @@ cryo_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
                   LockWaitPolicy wait_policy, uint8 flags,
                   TM_FailureData *tmfd)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
+}
+
+static void
+cryo_get_latest_tid(TableScanDesc scan,
+                    ItemPointer tid)
+{
+    NOT_IMPLEMENTED;
+}
+
+static TransactionId
+cryo_compute_xid_horizon_for_tuples(Relation rel,
+                                    ItemPointerData *items,
+                                    int nitems)
+{
+    NOT_IMPLEMENTED;
 }
 
 static void
@@ -576,13 +617,13 @@ cryo_relation_set_new_filenode(Relation rel,
 static void
 cryo_relation_nontransactional_truncate(Relation rel)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
 cryo_relation_copy_data(Relation rel, const RelFileNode *newrnode)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
@@ -595,14 +636,14 @@ cryo_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
                                double *tups_vacuumed,
                                double *tups_recently_dead)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
 cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
                              BufferAccessStrategy bstrategy)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
@@ -610,11 +651,11 @@ cryo_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
                              double *liverows, double *deadrows,
                              TupleTableSlot *slot)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static double
-cryo_index_build_range_scan(Relation relation,
+cryo_index_build_range_scan(Relation rel,
                             Relation indexRelation,
                             IndexInfo *indexInfo,
                             bool allow_sync,
@@ -626,8 +667,146 @@ cryo_index_build_range_scan(Relation relation,
                             void *callback_state,
                             TableScanDesc scan)
 {
-    elog(ERROR, "not implemented");
+    Datum		values[INDEX_MAX_KEYS];
+    bool        isnull[INDEX_MAX_KEYS];
+    double      reltuples;
+	ExprState  *predicate;
+    TupleTableSlot *slot;
+    EState     *estate;
+    ExprContext *econtext;
+    Snapshot    snapshot;
+	TransactionId OldestXmin;
+	bool		need_unregister_snapshot = false;
+
+    if (start_blockno != 0 || numblocks != InvalidBlockNumber)
+        elog(ERROR, "partial range scan is not supported");
+
+    /*
+     * Need an EState for evaluation of index expressions and partial-index
+     * predicates.  Also a slot to hold the current tuple.
+     */
+    estate = CreateExecutorState();
+    econtext = GetPerTupleExprContext(estate);
+    slot = table_slot_create(rel, NULL);
+
+    /* Arrange for econtext's scan tuple to be the tuple under test */
+    econtext->ecxt_scantuple = slot;
+
+    /* Set up execution state for predicate, if any. */
+    predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+
+    /*
+     * Prepare for scan of the base relation.  In a normal index build, we use
+     * SnapshotAny because we must retrieve all tuples and do our own time
+     * qual checks (because we have to index RECENTLY_DEAD tuples). In a
+     * concurrent build, or during bootstrap, we take a regular MVCC snapshot
+     * and index whatever's live according to that.
+     */
+    OldestXmin = InvalidTransactionId;
+
+    /* okay to ignore lazy VACUUMs here */
+    if (!IsBootstrapProcessingMode() && !indexInfo->ii_Concurrent)
+        OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
+
+    if (!scan)
+    {
+        /*
+         * Serial index build.
+         *
+         * Must begin our own heap scan in this case.  We may also need to
+         * register a snapshot whose lifetime is under our direct control.
+         */
+        if (!TransactionIdIsValid(OldestXmin))
+        {
+            snapshot = RegisterSnapshot(GetTransactionSnapshot());
+            need_unregister_snapshot = true;
+        }
+        else
+            snapshot = SnapshotAny;
+
+        scan = table_beginscan_strat(rel,  /* relation */
+                                     snapshot,  /* snapshot */
+                                     0, /* number of keys */
+                                     NULL,  /* scan key */
+                                     true,  /* buffer access strategy OK */
+                                     allow_sync);   /* syncscan OK? */
+    }
+    else
+    {
+        /*
+         * Parallel index build.
+         *
+         * Parallel case never registers/unregisters own snapshot.  Snapshot
+         * is taken from parallel heap scan, and is SnapshotAny or an MVCC
+         * snapshot, based on same criteria as serial case.
+         */
+        Assert(!IsBootstrapProcessingMode());
+        Assert(allow_sync);
+        snapshot = scan->rs_snapshot;
+    }
+
+    /* Publish number of blocks to scan */
+    if (progress)
+    {
+        /* TODO */
+    }
+    
+    reltuples = 0;
+
+	while (cryo_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/* Report scan progress, if asked to. */
+		if (progress)
+		{
+            /* TODO */
+        }
+
+        reltuples += 1;
+
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+		/*
+		 * In a partial index, discard tuples that don't satisfy the
+		 * predicate.
+		 */
+		if (predicate != NULL)
+		{
+			if (!ExecQual(predicate, econtext))
+				continue;
+		}
+
+		FormIndexDatum(indexInfo,
+					   slot,
+					   estate,
+					   values,
+					   isnull);
+    }
+
+    /* TODO: callback */
+
+    if (progress)
+    {
+        /* TODO */
+    }
+	table_endscan(scan);
+
+	/* we can now forget our snapshot, if set and registered by us */
+	if (need_unregister_snapshot)
+		UnregisterSnapshot(snapshot);
+
+	ExecDropSingleTupleTableSlot(slot);
+
+	FreeExecutorState(estate);
+
+	/* These may have been pointing to the now-gone estate */
+	indexInfo->ii_ExpressionsState = NIL;
+	indexInfo->ii_PredicateState = NULL;
+
+	return reltuples;
 }
+
 
 static void
 cryo_index_validate_scan(Relation relation,
@@ -636,7 +815,7 @@ cryo_index_validate_scan(Relation relation,
                          Snapshot snapshot,
                          ValidateIndexState *state)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static uint64
@@ -678,21 +857,21 @@ cryo_estimate_rel_size(Relation rel, int32 *attr_widths,
 static bool
 cryo_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static bool
 cryo_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
                               TupleTableSlot *slot)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 static void
 cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                 BufferAccessStrategy bstrategy)
 {
-    elog(ERROR, "not implemented");
+    NOT_IMPLEMENTED;
 }
 
 /*
@@ -729,7 +908,9 @@ static const TableAmRoutine cryo_methods =
 
     .tuple_fetch_row_version = cryo_fetch_row_version,
     .tuple_tid_valid = cryo_tuple_tid_valid,
+    .tuple_get_latest_tid = cryo_get_latest_tid,
     .tuple_satisfies_snapshot = cryo_tuple_satisfies_snapshot,
+	.compute_xid_horizon_for_tuples = cryo_compute_xid_horizon_for_tuples,
 
     .relation_set_new_filenode = cryo_relation_set_new_filenode,
     .relation_nontransactional_truncate = cryo_relation_nontransactional_truncate,

@@ -9,7 +9,7 @@ cryo_init_page(CryoDataHeader *hdr)
     hdr->upper = CRYO_BLCKSZ;
 }
 
-bool
+int
 cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
 {
     CryoItemId  itemId;
@@ -18,7 +18,7 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
     if ((tuple->t_len + sizeof(ItemId)) > (d->upper - d->lower))
     {
         /* not enough space */
-        return false;
+        return -1;
     }
 
     /* insert tuple */
@@ -31,5 +31,5 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
     memcpy((char *) d + d->lower, &itemId, sizeof(ItemId));
     d->lower += sizeof(ItemId);
 
-    return true;
+    return (d->lower - CryoDataHeaderSize) / sizeof(CryoItemId);
 }
