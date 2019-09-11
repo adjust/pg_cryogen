@@ -9,6 +9,9 @@ cryo_init_page(CryoDataHeader *hdr)
     hdr->upper = CRYO_BLCKSZ;
 }
 
+/*
+ * Insert tuple into storage. Returns item position.
+ */
 int
 cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
 {
@@ -32,4 +35,22 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
     d->lower += sizeof(ItemId);
 
     return (d->lower - CryoDataHeaderSize) / sizeof(CryoItemId);
+}
+
+/*
+ * Allocate and return a tuple in the specified position.
+ */
+HeapTuple
+cryo_storage_fetch(CryoDataHeader *d, int pos)
+{
+    CryoItemId *itemId;
+    HeapTuple tuple = palloc0(sizeof(HeapTuple));
+
+    itemId = (CryoItemId *) d->data + pos;
+    Assert((char *) itemId < (char *) d + d->lower);  /* check boundaries */
+
+    tuple->t_data = (HeapTupleHeader) ((char *) d + itemId->off);
+    tuple->t_len = itemId->len;
+
+    return tuple;
 }

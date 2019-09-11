@@ -49,6 +49,7 @@ typedef struct
 
 void cryo_init_page(CryoDataHeader *hdr);
 int cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple);
+HeapTuple cryo_storage_fetch(CryoDataHeader *d, int pos);
 
 
 #endif /* __STORAGE_H__ */

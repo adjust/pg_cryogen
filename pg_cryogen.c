@@ -201,11 +201,14 @@ read_tuple:
     if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
     {
         /* read tuple */
+        /* TODO: move this logic to storage.c */
         CryoItemId *item = (CryoItemId *) hdr->data + scan->cur_item;
         HeapTuple tuple;
 
         tuple = palloc0(sizeof(HeapTupleData));
         tuple->t_len = item->len;
+        tuple->t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
+        ItemPointerSet(&tuple->t_self, scan->cur_block, scan->cur_item + 1);
         tuple->t_data = (HeapTupleHeader) (scan->data + item->off);
 
         ExecStoreHeapTuple(tuple, slot, false);
@@ -259,32 +262,57 @@ cryo_endscan(TableScanDesc sscan)
     pfree(scan);
 }
 
+typedef struct
+{
+    IndexFetchTableData base;
+    char    data[CRYO_BLCKSZ];
+} IndexFetchCryoData;
+
 static IndexFetchTableData *
 cryo_index_fetch_begin(Relation rel)
 {
-    NOT_IMPLEMENTED;
+	IndexFetchCryoData *cscan = palloc0(sizeof(IndexFetchCryoData));
+
+	cscan->base.rel = rel;
+	return &cscan->base;
 }
 
 static void
 cryo_index_fetch_reset(IndexFetchTableData *scan)
 {
-    NOT_IMPLEMENTED;
+    /* nothing to reset yet */
 }
 
 static void
 cryo_index_fetch_end(IndexFetchTableData *scan)
 {
-    NOT_IMPLEMENTED;
+    pfree(scan);
 }
 
 static bool
 cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
-                         ItemPointer tid,
-                         Snapshot snapshot,
-                         TupleTableSlot *slot,
-                         bool *call_again, bool *all_dead)
+                       ItemPointer tid,
+                       Snapshot snapshot,
+                       TupleTableSlot *slot,
+                       bool *call_again, bool *all_dead)
 {
-    NOT_IMPLEMENTED;
+    IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
+    CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
+    HeapTuple   tuple;
+    bool isnull = false;
+
+    /* TODO: add some kind of buffer cache */
+    cryo_read_data(cscan->base.rel,
+                   ItemPointerGetBlockNumber(tid),
+                   NULL,
+                   cscan->data);
+
+    /* position in item pointer starts with 1 */
+    tuple = cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid) - 1);
+    ExecStoreHeapTuple(tuple, slot, false);
+    pfree(tuple);
+
+    return true;
 }
 
 static bool
@@ -511,7 +539,8 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
         modifyState.modified = true;
 
         slots[i]->tts_tableOid = RelationGetRelid(relation);
-        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
+        /* position in item pointer starts with 1 */
+        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos + 1);
     }
     cryo_preserve(&modifyState, false);
 }
@@ -755,6 +784,8 @@ cryo_index_build_range_scan(Relation rel,
 
 	while (cryo_getnextslot(scan, ForwardScanDirection, slot))
 	{
+        HeapTuple   tuple;
+
 		CHECK_FOR_INTERRUPTS();
 
 		/* Report scan progress, if asked to. */
@@ -782,9 +813,14 @@ cryo_index_build_range_scan(Relation rel,
 					   estate,
 					   values,
 					   isnull);
-    }
 
-    /* TODO: callback */
+        /* Call the AM's callback routine to process the tuple */
+        tuple = ExecCopySlotHeapTuple(slot);
+        tuple->t_self = slot->tts_tid;
+        callback(indexRelation, tuple, values, isnull, true, callback_state);
+
+        pfree(tuple);
+    }
 
     if (progress)
     {
