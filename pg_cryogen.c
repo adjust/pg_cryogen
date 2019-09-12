@@ -35,7 +35,6 @@ PG_MODULE_MAGIC;
         elog(ERROR, "function \"%s\" is not implemented", __func__); \
     } while (0)
 
-
 typedef struct CryoScanDescData
 {
     TableScanDescData   rs_base;
@@ -299,7 +298,6 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
     IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
     CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
     HeapTuple   tuple;
-    bool isnull = false;
 
     /* TODO: add some kind of buffer cache */
     cryo_read_data(cscan->base.rel,
@@ -311,6 +309,50 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
     tuple = cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid) - 1);
     ExecStoreHeapTuple(tuple, slot, false);
     pfree(tuple);
+
+    return true;
+}
+
+static bool
+cryo_scan_bitmap_next_block(TableScanDesc scan,
+                            struct TBMIterateResult *tbmres)
+{
+    CryoScanDesc    cscan = (CryoScanDesc) scan;
+    BlockNumber     blockno;
+
+    blockno = tbmres->blockno;
+    cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks, cscan->data);
+    cscan->cur_item = 0;
+
+    return true;
+}
+
+static bool
+cryo_scan_bitmap_next_tuple(TableScanDesc scan,
+                            struct TBMIterateResult *tbmres,
+                            TupleTableSlot *slot)
+{
+    CryoScanDesc cscan = (CryoScanDesc) scan;
+    CryoDataHeader *hdr = (CryoDataHeader *) cscan->data;
+    HeapTuple   tuple;
+    int         pos; 
+
+    /*
+    pos = tbmres->ntuples >= 0 ?
+        tbmres->offsets[scan->cur_item] :
+        scan->cur_item;
+    */
+
+    if (cscan->cur_item >= tbmres->ntuples)
+        return false;
+
+    pos = tbmres->offsets[cscan->cur_item];
+
+    tuple = cryo_storage_fetch(hdr, pos - 1);
+    ExecStoreHeapTuple(tuple, slot, false);
+    pfree(tuple);
+
+    cscan->cur_item++;
 
     return true;
 }
@@ -885,6 +927,7 @@ cryo_estimate_rel_size(Relation rel, int32 *attr_widths,
                          BlockNumber *pages, double *tuples,
                          double *allvisfrac)
 {
+    /* TODO */
     *pages = 0;
     *tuples = 0;
     *allvisfrac = 0;
@@ -964,8 +1007,10 @@ static const TableAmRoutine cryo_methods =
     .relation_estimate_size = cryo_estimate_rel_size,
 
     .scan_sample_next_block = cryo_scan_sample_next_block,
-    .scan_sample_next_tuple = cryo_scan_sample_next_tuple
+    .scan_sample_next_tuple = cryo_scan_sample_next_tuple,
 
+    .scan_bitmap_next_block = cryo_scan_bitmap_next_block,
+    .scan_bitmap_next_tuple = cryo_scan_bitmap_next_tuple
 };
 
 Datum

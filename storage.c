@@ -1,5 +1,16 @@
 #include "storage.h"
+#include "access/htup_details.h"
 
+
+/*
+ * From tidbitmap.c; currently we can't store more than this number of tuples
+ * if we want to use bitmapscan. Change it to INT_MAX if you don't need
+ * bitmapscan.
+ */
+#define MAX_TUPLES_PER_PAGE  MaxHeapTuplesPerPage
+
+#define CryoPageLastItemPos(hdr) \
+    (((d)->lower - CryoDataHeaderSize) / sizeof(CryoItemId))
 
 void
 cryo_init_page(CryoDataHeader *hdr)
@@ -18,7 +29,8 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
     CryoItemId  itemId;
 
     /* check there is enough space */
-    if ((tuple->t_len + sizeof(ItemId)) > (d->upper - d->lower))
+    if ((tuple->t_len + sizeof(ItemId)) > (d->upper - d->lower)
+        || CryoPageLastItemPos(d) + 1 >= MAX_TUPLES_PER_PAGE)
     {
         /* not enough space */
         return -1;
@@ -34,7 +46,7 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
     memcpy((char *) d + d->lower, &itemId, sizeof(ItemId));
     d->lower += sizeof(ItemId);
 
-    return (d->lower - CryoDataHeaderSize) / sizeof(CryoItemId);
+    return CryoPageLastItemPos(d);
 }
 
 /*
