@@ -35,6 +35,17 @@ PG_MODULE_MAGIC;
         elog(ERROR, "function \"%s\" is not implemented", __func__); \
     } while (0)
 
+/*
+ * There were old implementation that continues to write new tuples in the
+ * last block. It wasn't very relyable as if there is an error somewhere 
+ * between writes of pages of one block we'd end up with a broken storage with
+ * half new pages and half old. To fix that we now write new tuples into a new
+ * block on every multi_insert. It's a bit less space efficient but more
+ * durable. To keep previous implementation just in case this define was
+ * introduced.
+ */
+#define ONE_WRITE_ONE_BLOCK
+
 typedef struct CryoScanDescData
 {
     TableScanDescData   rs_base;
@@ -288,6 +299,11 @@ cryo_index_fetch_end(IndexFetchTableData *scan)
     pfree(scan);
 }
 
+/*
+ * Currently it's a super inefficient implementation that reads and
+ * decompresses entire block for every iteration. Need to add a buffer cache
+ * for cryo pages.
+ */
 static bool
 cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                        ItemPointer tid,
@@ -513,6 +529,10 @@ cryo_preserve(CryoModifyState *state, bool advance)
     metapage = (CryoMetaPage *)
         GenericXLogRegisterBuffer(xlog_state, state->metabuf,
                                   GENERIC_XLOG_FULL_IMAGE);
+#ifdef ONE_WRITE_ONE_BLOCK
+    if (advance)
+        block += i;
+#endif
     metapage->target_block = state->target_block = block;
     MarkBufferDirty(state->metabuf);
     GenericXLogFinish(xlog_state);
@@ -521,8 +541,10 @@ cryo_preserve(CryoModifyState *state, bool advance)
     for (i = 0; i < npages; ++i)
         UnlockReleaseBuffer(buffers[i]);
 
+#ifndef ONE_WRITE_ONE_BLOCK
     if (advance)
         state->target_block = state->target_block + i;
+#endif
 }
 
 static void
@@ -538,19 +560,23 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     modifyState.metabuf = cryo_load_meta(relation);
     if (modifyState.target_block == 0)
     {
-        /* This is a new block */
+        /* This is a first data block in the relation */
         cryo_init_page(hdr);
     }
     else
     {
+#ifdef ONE_WRITE_ONE_BLOCK
         /* 
-         * TODO: in order to ensure that storage is  consistent its better
-         * to create entirely new block instead of adding tuples to an
-         * existing one
+         * In order to ensure that storage is  consistent we create entirely
+         * new block for every multi_insert instead of adding tuples to an
+         * existing one. This also makes visibility check much simpler and
+         * faster: we just check transaction id in a block header.
          */
-
+        cryo_init_page(hdr);
+#else
         /* Read the target block contents into modifyState.data */
         cryo_read_data(relation, modifyState.target_block, NULL, modifyState.data);
+#endif
     }
     modifyState.relation = relation;
     modifyState.modified = false;
@@ -584,14 +610,25 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
         /* position in item pointer starts with 1 */
         ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos + 1);
     }
+
+#ifdef ONE_WRITE_ONE_BLOCK
+    /*
+     * Advance target_block so that next tuple will be written into a new
+     * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
+     * details.
+     */
+    cryo_preserve(&modifyState, true);
+#else
     cryo_preserve(&modifyState, false);
+#endif
+
+    UnlockReleaseBuffer(modifyState.metabuf);
+    modifyState.modified = false;
 }
 
 static void
 cryo_finish_bulk_insert(Relation rel, int options)
 {
-    modifyState.modified = false;
-    UnlockReleaseBuffer(modifyState.metabuf);
 }
 
 static TM_Result
