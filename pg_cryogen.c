@@ -322,7 +322,7 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                    cscan->data);
 
     /* position in item pointer starts with 1 */
-    tuple = cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid) - 1);
+    tuple = cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid));
     ExecStoreHeapTuple(tuple, slot, false);
     pfree(tuple);
 
@@ -364,7 +364,7 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
 
     pos = tbmres->offsets[cscan->cur_item];
 
-    tuple = cryo_storage_fetch(hdr, pos - 1);
+    tuple = cryo_storage_fetch(hdr, pos);
     ExecStoreHeapTuple(tuple, slot, false);
     pfree(tuple);
 
@@ -562,6 +562,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     {
         /* This is a first data block in the relation */
         cryo_init_page(hdr);
+        modifyState.target_block = 1;
     }
     else
     {
@@ -608,7 +609,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
         slots[i]->tts_tableOid = RelationGetRelid(relation);
         /* position in item pointer starts with 1 */
-        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos + 1);
+        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
     }
 
 #ifdef ONE_WRITE_ONE_BLOCK

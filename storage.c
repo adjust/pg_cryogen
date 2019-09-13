@@ -58,7 +58,8 @@ cryo_storage_fetch(CryoDataHeader *d, int pos)
     CryoItemId *itemId;
     HeapTuple tuple = palloc0(sizeof(HeapTuple));
 
-    itemId = (CryoItemId *) d->data + pos;
+    /* input pos is 1 based */
+    itemId = (CryoItemId *) d->data + pos - 1;
     Assert((char *) itemId < (char *) d + d->lower);  /* check boundaries */
 
     tuple->t_data = (HeapTupleHeader) ((char *) d + itemId->off);
