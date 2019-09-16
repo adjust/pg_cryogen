@@ -53,10 +53,10 @@ cryo_storage_insert(CryoDataHeader *d, HeapTuple tuple)
  * Allocate and return a tuple in the specified position.
  */
 HeapTuple
-cryo_storage_fetch(CryoDataHeader *d, int pos)
+cryo_storage_fetch(CryoDataHeader *d, int pos, HeapTuple tuple)
 {
     CryoItemId *itemId;
-    HeapTuple tuple = palloc0(sizeof(HeapTuple));
+    //HeapTuple tuple = palloc0(sizeof(HeapTuple));
 
     /* input pos is 1 based */
     itemId = (CryoItemId *) d->data + pos - 1;

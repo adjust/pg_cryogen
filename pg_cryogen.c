@@ -193,8 +193,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->rs_base.rs_flags = flags;
     scan->cur_item = 0;
     scan->cur_block = 1;
-
-    cryo_read_data(relation, scan->cur_block, &scan->nblocks, scan->data);
+    scan->nblocks = 0;
 
     return (TableScanDesc) scan;
 }
@@ -204,8 +203,12 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
 {
     CryoScanDesc scan = (CryoScanDesc) sscan;
     CryoDataHeader *hdr = (CryoDataHeader *) scan->data;
+    Relation rel = scan->rs_base.rs_rd;
 
     ExecClearTuple(slot);
+
+    if (scan->nblocks == 0)
+        cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
 
 read_tuple:
     if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
@@ -229,8 +232,6 @@ read_tuple:
     }
     else
     {
-        Relation rel = scan->rs_base.rs_rd;
-
         scan->cur_block += scan->nblocks;
         /* TODO: use metapage->target_block instead of number of blocks */
         if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
@@ -313,7 +314,7 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
 {
     IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
     CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
-    HeapTuple   tuple;
+    HeapTupleData       tuple;
 
     /* TODO: add some kind of buffer cache */
     cryo_read_data(cscan->base.rel,
@@ -322,9 +323,8 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                    cscan->data);
 
     /* position in item pointer starts with 1 */
-    tuple = cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid));
-    ExecStoreHeapTuple(tuple, slot, false);
-    pfree(tuple);
+    cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid), &tuple);
+    ExecStoreHeapTuple(&tuple, slot, false);
 
     return true;
 }
@@ -336,9 +336,30 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     BlockNumber     blockno;
 
+    /* prevent reading in the middle of cryo blocks */
+    if (tbmres->blockno < cscan->cur_block + cscan->nblocks)
+        return false;
+
     blockno = tbmres->blockno;
     cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks, cscan->data);
-    cscan->cur_item = 0;
+    if (cscan->nblocks == 0)
+        return false;
+    cscan->cur_block = blockno;
+
+    /* lossy scan? */
+    if (tbmres->ntuples < 0)
+    {
+        /* for lossy scan we interpret cur_item as a position in the block */
+        cscan->cur_item = 1;
+    }
+    else
+    {
+        /*
+         * ...and for non-lossy cur_item points to the position in
+         * tmbres->offsets.
+         */
+        cscan->cur_item = 0;
+    }
 
     return true;
 }
@@ -348,25 +369,32 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
                             struct TBMIterateResult *tbmres,
                             TupleTableSlot *slot)
 {
-    CryoScanDesc cscan = (CryoScanDesc) scan;
+    CryoScanDesc    cscan = (CryoScanDesc) scan;
     CryoDataHeader *hdr = (CryoDataHeader *) cscan->data;
-    HeapTuple   tuple;
-    int         pos; 
+    HeapTupleData   tuple;
+    int     pos; 
 
-    /*
-    pos = tbmres->ntuples >= 0 ?
-        tbmres->offsets[scan->cur_item] :
-        scan->cur_item;
-    */
-
-    if (cscan->cur_item >= tbmres->ntuples)
+    /* prevent reading in the middle of cryo blocks */
+    if (tbmres->blockno != cscan->cur_block)
         return false;
 
-    pos = tbmres->offsets[cscan->cur_item];
+    if (tbmres->ntuples >= 0)
+    {
+        if (cscan->cur_item >= tbmres->ntuples)
+            return false;
 
-    tuple = cryo_storage_fetch(hdr, pos);
-    ExecStoreHeapTuple(tuple, slot, false);
-    pfree(tuple);
+        pos = tbmres->offsets[cscan->cur_item];
+    }
+    else
+    {
+        if (cscan->cur_item * sizeof(CryoItemId) >= hdr->lower)
+            return false;
+
+        pos = cscan->cur_item;
+    }
+
+    cryo_storage_fetch(hdr, pos, &tuple);
+    ExecStoreHeapTuple(&tuple, slot, false);
 
     cscan->cur_item++;
 
