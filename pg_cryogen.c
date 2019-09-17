@@ -124,7 +124,7 @@ cryo_decompress(const char *compressed, Size compressed_size, char *out)
  * Read and reassemble compressed data from the buffer manager starting
  * with `block` and decompress it.
  */
-static void
+static bool
 cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
 {
     Buffer      buf;
@@ -138,11 +138,22 @@ cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
     {
         cryo_init_page((CryoDataHeader *) out);
         *nblocks = 0;
-        return;
+        return true; /* TODO */
     }
 
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
+
+    /*
+     * In case of brin index bitmap scan can try to read data not from the
+     * first page.
+     */
+    if (page->curpage != 0)
+    {
+        ReleaseBuffer(buf);
+        return false;
+    }
+
     size = compressed_size = page->compressed_size;
     p = compressed = palloc(compressed_size);
     if (nblocks)
@@ -170,6 +181,8 @@ cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
     }
 
     cryo_decompress(compressed, compressed_size, out);
+
+    return true;
 }
 
 static TableScanDesc
@@ -341,7 +354,12 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
         return false;
 
     blockno = tbmres->blockno;
-    cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks, cscan->data);
+    if (!cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks,
+                        cscan->data))
+    {
+        return false;
+    }
+
     if (cscan->nblocks == 0)
         return false;
     cscan->cur_block = blockno;
@@ -371,7 +389,7 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
 {
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     CryoDataHeader *hdr = (CryoDataHeader *) cscan->data;
-    HeapTupleData   tuple;
+    HeapTuple tuple;
     int     pos; 
 
     /* prevent reading in the middle of cryo blocks */
@@ -393,8 +411,12 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
         pos = cscan->cur_item;
     }
 
-    cryo_storage_fetch(hdr, pos, &tuple);
-    ExecStoreHeapTuple(&tuple, slot, false);
+    tuple = palloc0(sizeof(HeapTupleData));
+    cryo_storage_fetch(hdr, pos, tuple);
+    tuple->t_tableOid = RelationGetRelid(cscan->rs_base.rs_rd);
+    ItemPointerSet(&tuple->t_self, cscan->cur_block, pos);
+
+    ExecStoreHeapTuple(tuple, slot, true);
 
     cscan->cur_item++;
 
