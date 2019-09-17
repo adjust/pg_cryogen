@@ -5,9 +5,12 @@
 #include "access/htup.h"
 #include "storage/bufpage.h"
 
-
+/*
+ * XXX probably it makes sense to make page size configurable for each table
+ * but that would require more complex solution for cache
+ */
 //#define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
-#define CRYO_BLCKSZ (1 << 16)   /* 1Mb */
+#define CRYO_BLCKSZ (1 << 16)   /* 64Kb */
 
 typedef struct
 {
@@ -28,6 +31,7 @@ typedef struct
     uint16  npages;         /* number of pages for this cryo block */
     uint16  curpage;
     uint32  compressed_size;
+    TransactionId insert_xid; /* transaction performed insertion */
 } CryoPageHeader;
 
 /* */

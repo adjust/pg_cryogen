@@ -22,6 +22,7 @@
 
 #include "lz4.h"
 
+#include "cache.h"
 #include "storage.h"
 
 
@@ -79,6 +80,7 @@ _PG_init(void)
     /*
     modifyState.data = palloc0(CRYO_BLCKSZ);
     */
+    cryo_init_cache();
 }
 
 static const TupleTableSlotOps *
@@ -106,27 +108,13 @@ cryo_compress(const char *data, Size *compressed_size)
 }
 
 /*
- * Decompress and store result in `out`
- */
-static void
-cryo_decompress(const char *compressed, Size compressed_size, char *out)
-{
-    int bytes;
-
-    bytes = LZ4_decompress_safe(compressed, out, compressed_size, CRYO_BLCKSZ);
-    if (bytes < 0)
-        elog(ERROR, "pg_cryogen: decompression failed");
-
-    Assert(CRYO_BLCKSZ == bytes);
-}
-
-/*
  * Read and reassemble compressed data from the buffer manager starting
  * with `block` and decompress it.
  */
 static bool
 cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
 {
+#if 0
     Buffer      buf;
     CryoPageHeader *page;
     char       *compressed, *p;
@@ -181,6 +169,17 @@ cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
     }
 
     cryo_decompress(compressed, compressed_size, out);
+
+    return true;
+#endif
+    char *data;
+    CacheEntry entry;
+
+    entry = cryo_read_block(rel, block);
+    *nblocks = cryo_cache_get_pg_nblocks(entry);
+
+    /* TODO: just for test purposes */
+    memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
 
     return true;
 }
