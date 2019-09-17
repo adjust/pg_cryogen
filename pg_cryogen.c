@@ -176,7 +176,8 @@ cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
     CacheEntry entry;
 
     entry = cryo_read_block(rel, block);
-    *nblocks = cryo_cache_get_pg_nblocks(entry);
+    if (nblocks)
+        *nblocks = cryo_cache_get_pg_nblocks(entry);
 
     /* TODO: just for test purposes */
     memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
@@ -326,17 +327,19 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
 {
     IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
     CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
-    HeapTupleData       tuple;
+    HeapTuple           tuple;
 
-    /* TODO: add some kind of buffer cache */
     cryo_read_data(cscan->base.rel,
                    ItemPointerGetBlockNumber(tid),
                    NULL,
                    cscan->data);
 
-    /* position in item pointer starts with 1 */
-    cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid), &tuple);
-    ExecStoreHeapTuple(&tuple, slot, false);
+    tuple = palloc0(sizeof(HeapTupleData));
+    tuple->t_tableOid = RelationGetRelid(cscan->base.rel);
+    tuple->t_self = *tid;
+    cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid), tuple);
+
+    ExecStoreHeapTuple(tuple, slot, true);
 
     return true;
 }
