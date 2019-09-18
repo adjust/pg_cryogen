@@ -31,7 +31,7 @@ typedef struct
     uint16  npages;         /* number of pages for this cryo block */
     uint16  curpage;
     uint32  compressed_size;
-    TransactionId insert_xid; /* transaction performed insertion */
+    TransactionId created_xid; /* transaction performed insertion */
 } CryoPageHeader;
 
 /* */

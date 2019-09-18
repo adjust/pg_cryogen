@@ -6,6 +6,7 @@
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -109,35 +110,6 @@ cryo_compress(const char *data, Size *compressed_size)
     return compressed;
 }
 
-/*
- * Read and reassemble compressed data from the buffer manager starting
- * with `block` and decompress it.
-  *
- * Possible return values:
- *      CRYO_ERR_SUCCESS: success;
- *      CRYO_ERR_WRONG_STARTING_BLOCK: specified blockno is not a starting
- *          block of cryo page;
- *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
- */
-static CryoError
-cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks,
-               CacheEntry *cacheEntry)
-{
-    CryoError   err;
-
-    err = cryo_read_block(rel, block, cacheEntry);
-    if (err == CRYO_ERR_SUCCESS)
-    {
-        if (nblocks)
-        *nblocks = cryo_cache_get_pg_nblocks(*cacheEntry);
-
-        /* TODO: just for test purposes */
-        //memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
-    }
-
-    return err;
-}
-
 static TableScanDesc
 cryo_beginscan(Relation relation, Snapshot snapshot,
                int nkeys, ScanKey key,
@@ -165,6 +137,26 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
 }
 
 static bool
+xid_is_visible(Snapshot snapshot, TransactionId xid)
+{
+	if (TransactionIdIsCurrentTransactionId(xid))
+	{
+			return true;
+	}
+	else if (XidInMVCCSnapshot(xid, snapshot))
+		return false;
+	else if (TransactionIdDidCommit(xid))
+	{
+		return true;
+	}
+	else
+	{
+		/* it must have aborted or crashed */
+		return false;
+	}
+}
+
+static bool
 cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
     CryoScanDesc    scan = (CryoScanDesc) sscan;
@@ -174,49 +166,56 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
 
     ExecClearTuple(slot);
 
-    if (scan->nblocks == 0)
+read_block:
+    if (scan->cur_item == 0)
     {
-        /* read the very first page */
-        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, &scan->cacheEntry);
+        /*
+         * Either it's a first block to scan or there are no more tuples in the
+         * current block. Proceed to the next one,
+         */
+        scan->cur_block += scan->nblocks;
+
+        /* TODO: use metapage->target_block instead of number of blocks */
+        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
+            return false;
+
+        err = cryo_read_data(rel, scan->cur_block, &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+        scan->nblocks = cryo_cache_get_pg_nblocks(scan->cacheEntry);
+        scan->cur_item = 1;
+
+        if (!xid_is_visible(sscan->rs_snapshot, cryo_cache_get_xid(scan->cacheEntry)))
+        {
+            /* 
+             * Transaction created this block is not visible, proceed to the
+             * next block
+             */
+            scan->cur_item = 0;
+            goto read_block;
+        }
     }
 
-read_tuple:
     hdr = (CryoDataHeader *) cryo_cache_get_data(scan->cacheEntry);
-    if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
+    if ((scan->cur_item) * sizeof(CryoItemId) < hdr->lower)
     {
         /* read tuple */
-        /* TODO: move this logic to storage.c */
-        CryoItemId *item = (CryoItemId *) hdr->data + scan->cur_item;
         HeapTuple tuple;
 
         tuple = palloc0(sizeof(HeapTupleData));
-        tuple->t_len = item->len;
+        cryo_storage_fetch(hdr, scan->cur_item, tuple);
         tuple->t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
-        ItemPointerSet(&tuple->t_self, scan->cur_block, scan->cur_item + 1);
-        tuple->t_data = (HeapTupleHeader) ((char *) hdr + item->off);
+        ItemPointerSet(&tuple->t_self, scan->cur_block, scan->cur_item);
 
-        ExecStoreHeapTuple(tuple, slot, false);
-
+        ExecStoreHeapTuple(tuple, slot, true);
         scan->cur_item++;
 
         return true;
     }
     else
     {
-        /* no more tuple in the current block, proceed to the next one */
-        scan->cur_block += scan->nblocks;
-        /* TODO: use metapage->target_block instead of number of blocks */
-        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
-            return false;
-
-        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, &scan->cacheEntry);
-        if (err != CRYO_ERR_SUCCESS)
-            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
-
         scan->cur_item = 0;
-        goto read_tuple;
+        goto read_block;
     }
 
     return false;
@@ -290,7 +289,6 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
 
     err = cryo_read_data(cscan->base.rel,
                          ItemPointerGetBlockNumber(tid),
-                         NULL,
                          &cscan->cacheEntry);
     hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
@@ -320,8 +318,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
 
     blockno = tbmres->blockno;
 
-    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks,
-                         &cscan->cacheEntry);
+    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->cacheEntry);
     switch (err)
     {
         case CRYO_ERR_SUCCESS:
@@ -339,6 +336,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
     }
 
+    cscan->nblocks = cryo_cache_get_pg_nblocks(cscan->cacheEntry);
     if (cscan->nblocks == 0)
         return false;
     cscan->cur_block = blockno;
@@ -537,6 +535,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
         hdr->npages = npages;
         hdr->curpage = i;
         hdr->compressed_size = size;
+        hdr->created_xid = GetCurrentTransactionId();
         hdr->base.pd_checksum = 0; /* TODO */
         /*
          * Can't leave pd_upper = 0 because then page will be considered new
@@ -607,7 +606,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
         cryo_init_page(hdr);
 #else
         /* Read the target block contents into modifyState.data */
-        cryo_read_data(relation, modifyState.target_block, NULL, modifyState.data);
+        cryo_read_data(relation, modifyState.target_block,  modifyState.data);
 #endif
     }
     modifyState.relation = relation;

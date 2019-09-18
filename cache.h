@@ -16,9 +16,10 @@ typedef enum
 typedef int CacheEntry;
 
 void cryo_init_cache(void);
-CryoError cryo_read_block(Relation rel, BlockNumber block, CacheEntry *result);
+CryoError cryo_read_data(Relation rel, BlockNumber block, CacheEntry *result);
 uint32 cryo_cache_get_pg_nblocks(CacheEntry entry);
 char *cryo_cache_get_data(CacheEntry entry);
+TransactionId cryo_cache_get_xid(CacheEntry entry);
 char *cryo_cache_err(CryoError err);
 
 

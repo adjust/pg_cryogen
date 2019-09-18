@@ -40,6 +40,7 @@ typedef struct
     PageId      key;
     TS          ts;         /* timestamp for LRU */
     uint32      nblocks;    /* number of postgres blocks */
+    TransactionId xid;      /* transaction created block */
     char        data[CRYO_BLCKSZ];
 } CacheEntryHeader;
 
@@ -107,9 +108,11 @@ cryo_decompress(const char *compressed, Size compressed_size, char *out)
  *      CRYO_ERR_WRONG_STARTING_BLOCK: specified blockno is not a starting
  *          block of cryo page;
  *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
+ *
+ * XXX Move visibility check here to avoid unnecessary i/o.
  */
 static CryoError
-cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
+cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
 {
     Buffer      buf;
     CryoPageHeader *page;
@@ -132,8 +135,8 @@ cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out
 
     size = compressed_size = page->compressed_size;
     p = compressed = palloc(compressed_size);
-    if (nblocks)
-        *nblocks = 1;
+    entry->nblocks = 1;
+    entry->xid = page->created_xid;
 
     while (true)
     {
@@ -151,19 +154,17 @@ cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out
         /* read the next block */
         buf = ReadBuffer(rel, ++block);
         page = (CryoPageHeader *) BufferGetPage(buf);
-
-        if (nblocks)
-            (*nblocks)++;
+        entry->nblocks++;
     }
 
-    if (!cryo_decompress(compressed, compressed_size, out))
+    if (!cryo_decompress(compressed, compressed_size, entry->data))
         return CRYO_ERR_DECOMPRESSION_FAILED;
 
     return CRYO_ERR_SUCCESS;
 }
 
 CryoError
-cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
+cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
 {
     bool    found;
     PageId  pageId = {
@@ -227,8 +228,7 @@ cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
         /* load cryo block */
         cache[item->entry].ts = get_current_timestamp_ms();
         cache[item->entry].key = item->key;
-        err = cryo_read_decompress(rel, blockno, &cache[new_entry].nblocks,
-                                   cache[new_entry].data);
+        err = cryo_read_decompress(rel, blockno, &cache[new_entry]);
         if (err != CRYO_ERR_SUCCESS)
         {
             *result = item->entry = InvalidCacheEntry;
@@ -257,6 +257,12 @@ cryo_cache_get_data(CacheEntry entry)
     header->ts = get_current_timestamp_ms();
 
     return header->data;
+}
+
+TransactionId
+cryo_cache_get_xid(CacheEntry entry)
+{
+    return cache[entry].xid;
 }
 
 char *
