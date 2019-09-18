@@ -33,4 +33,4 @@ create table my_table (...) using pg_cryogen;
 
 Due to the specifics of current implementation of pluggable storage API and storage layout of `pg_cryogen` it was only possible to implement bulk inserts via COPY command. Therefore regular inserts are not implemented.
 
-Both index scan and bitmap scan are implemented but still require further work to improve performance.
+Both index scan and bitmap scans are implemented as well.

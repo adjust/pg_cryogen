@@ -53,10 +53,15 @@ typedef struct CryoScanDescData
     uint32              nblocks;
     BlockNumber         cur_block;
     uint32              cur_item;
-    char                data[CRYO_BLCKSZ];  /* decompressed data */
+    CacheEntry          cacheEntry; /* cached decompressed page reference */
 } CryoScanDescData;
 typedef CryoScanDescData *CryoScanDesc;
 
+typedef struct
+{
+    IndexFetchTableData base;
+    CacheEntry          cacheEntry; /* cached decompressed page reference */
+} IndexFetchCryoData;
 
 typedef struct CryoModifyState
 {
@@ -115,19 +120,19 @@ cryo_compress(const char *data, Size *compressed_size)
  *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
  */
 static CryoError
-cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
+cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks,
+               CacheEntry *cacheEntry)
 {
-    CacheEntry  entry;
     CryoError   err;
 
-    err = cryo_read_block(rel, block, &entry);
+    err = cryo_read_block(rel, block, cacheEntry);
     if (err == CRYO_ERR_SUCCESS)
     {
         if (nblocks)
-        *nblocks = cryo_cache_get_pg_nblocks(entry);
+        *nblocks = cryo_cache_get_pg_nblocks(*cacheEntry);
 
         /* TODO: just for test purposes */
-        memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
+        //memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
     }
 
     return err;
@@ -163,7 +168,7 @@ static bool
 cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
     CryoScanDesc    scan = (CryoScanDesc) sscan;
-    CryoDataHeader *hdr = (CryoDataHeader *) scan->data;
+    CryoDataHeader *hdr;
     Relation        rel = scan->rs_base.rs_rd;
     CryoError       err;
 
@@ -172,12 +177,13 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
     if (scan->nblocks == 0)
     {
         /* read the very first page */
-        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
     }
 
 read_tuple:
+    hdr = (CryoDataHeader *) cryo_cache_get_data(scan->cacheEntry);
     if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
     {
         /* read tuple */
@@ -189,7 +195,7 @@ read_tuple:
         tuple->t_len = item->len;
         tuple->t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
         ItemPointerSet(&tuple->t_self, scan->cur_block, scan->cur_item + 1);
-        tuple->t_data = (HeapTupleHeader) (scan->data + item->off);
+        tuple->t_data = (HeapTupleHeader) ((char *) hdr + item->off);
 
         ExecStoreHeapTuple(tuple, slot, false);
 
@@ -199,12 +205,13 @@ read_tuple:
     }
     else
     {
+        /* no more tuple in the current block, proceed to the next one */
         scan->cur_block += scan->nblocks;
         /* TODO: use metapage->target_block instead of number of blocks */
         if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
             return false;
 
-        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
@@ -243,12 +250,6 @@ cryo_endscan(TableScanDesc sscan)
     pfree(scan);
 }
 
-typedef struct
-{
-    IndexFetchTableData base;
-    char    data[CRYO_BLCKSZ];
-} IndexFetchCryoData;
-
 static IndexFetchTableData *
 cryo_index_fetch_begin(Relation rel)
 {
@@ -283,14 +284,15 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                        bool *call_again, bool *all_dead)
 {
     IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
-    CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
+    CryoDataHeader     *hdr;
     HeapTuple           tuple;
     CryoError           err;
 
     err = cryo_read_data(cscan->base.rel,
                          ItemPointerGetBlockNumber(tid),
                          NULL,
-                         cscan->data);
+                         &cscan->cacheEntry);
+    hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
         elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
@@ -319,7 +321,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     blockno = tbmres->blockno;
 
     err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks,
-                         cscan->data);
+                         &cscan->cacheEntry);
     switch (err)
     {
         case CRYO_ERR_SUCCESS:
@@ -365,9 +367,11 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
                             TupleTableSlot *slot)
 {
     CryoScanDesc    cscan = (CryoScanDesc) scan;
-    CryoDataHeader *hdr = (CryoDataHeader *) cscan->data;
+    CryoDataHeader *hdr;
     HeapTuple tuple;
     int     pos; 
+
+    hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
 
     /* prevent reading in the middle of cryo blocks */
     if (tbmres->blockno != cscan->cur_block)
