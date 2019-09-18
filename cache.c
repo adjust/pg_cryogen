@@ -185,11 +185,12 @@ cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
     if (!found || item->entry == InvalidCacheEntry)
     {
         int i;
-        CacheEntry  new_entry;
+        CacheEntry  new_entry = InvalidCacheEntry;
         CryoError   err;
+        TS          min_ts = -1; /* max unsigned long long */
+        int         min_ts_pos;
 
         /* find available spot in cache or evict old cache entry */
-        /* TODO: add LRU strategy */
         for (i = 0; i < CACHE_SIZE; ++i)
         {
             if (cache[i].ts == 0)
@@ -197,6 +198,24 @@ cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
                 new_entry = i;
                 break;
             }
+
+            if (cache[i].ts < min_ts)
+                min_ts_pos = i;
+        }
+
+        if (new_entry == InvalidCacheEntry)
+        {
+            /*
+             * We didn't manage to find uninitialized cache entries. But we
+             * found least recently used one. We also need to remove the old
+             * record from pagemap.
+             */
+            elog(DEBUG1,
+                 "pg_cryogen: evicted cache entry for (%i, %i)",
+                 cache[min_ts_pos].key.relid,
+                 cache[min_ts_pos].key.blockno);
+            hash_search(pagemap, &cache[min_ts_pos].key, HASH_REMOVE, NULL);
+            new_entry = min_ts_pos;
         }
 
         /* cache entry is not found, load data from disk */
@@ -207,7 +226,7 @@ cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
 
         /* load cryo block */
         cache[item->entry].ts = get_current_timestamp_ms();
-
+        cache[item->entry].key = item->key;
         err = cryo_read_decompress(rel, blockno, &cache[new_entry].nblocks,
                                    cache[new_entry].data);
         if (err != CRYO_ERR_SUCCESS)
@@ -243,7 +262,7 @@ cryo_cache_get_data(CacheEntry entry)
 char *
 cryo_cache_err(CryoError err)
 {
-    switch (errno)
+    switch (err)
     {
         case CRYO_ERR_SUCCESS:
             return "success";
