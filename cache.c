@@ -84,23 +84,31 @@ get_current_timestamp_ms(void)
 /*
  * Decompress and store result in `out`
  */
-static void
+static bool
 cryo_decompress(const char *compressed, Size compressed_size, char *out)
 {
     int bytes;
 
     bytes = LZ4_decompress_safe(compressed, out, compressed_size, CRYO_BLCKSZ);
     if (bytes < 0)
-        elog(ERROR, "pg_cryogen: decompression failed");
+        return false;
 
     Assert(CRYO_BLCKSZ == bytes);
+
+    return true;
 }
 
 /*
  * Read and reassemble compressed data from the buffer manager starting
  * with `block` and decompress it.
+ *
+ * Possible return values:
+ *      CRYO_ERR_SUCCESS: success;
+ *      CRYO_ERR_WRONG_STARTING_BLOCK: specified blockno is not a starting
+ *          block of cryo page;
+ *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
  */
-static bool
+static CryoError
 cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
 {
     Buffer      buf;
@@ -108,14 +116,6 @@ cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out
     char       *compressed, *p;
     Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
     Size        compressed_size, size;
-
-    /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
-    if (RelationGetNumberOfBlocks(rel) <= block)
-    {
-        cryo_init_page((CryoDataHeader *) out);
-        *nblocks = 0;
-        return true; /* TODO */
-    }
 
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
@@ -127,7 +127,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out
     if (page->curpage != 0)
     {
         ReleaseBuffer(buf);
-        return false;
+        return CRYO_ERR_WRONG_STARTING_BLOCK;
     }
 
     size = compressed_size = page->compressed_size;
@@ -156,13 +156,14 @@ cryo_read_decompress(Relation rel, BlockNumber block, uint32 *nblocks, char *out
             (*nblocks)++;
     }
 
-    cryo_decompress(compressed, compressed_size, out);
+    if (!cryo_decompress(compressed, compressed_size, out))
+        return CRYO_ERR_DECOMPRESSION_FAILED;
 
-    return true;
+    return CRYO_ERR_SUCCESS;
 }
 
-CacheEntry
-cryo_read_block(Relation rel, BlockNumber blockno)
+CryoError
+cryo_read_block(Relation rel, BlockNumber blockno, CacheEntry *result)
 {
     bool    found;
     PageId  pageId = {
@@ -171,13 +172,21 @@ cryo_read_block(Relation rel, BlockNumber blockno)
     };
     PageIdCacheEntry *item;
 
+     /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
+    if (RelationGetNumberOfBlocks(rel) <= blockno)
+    {
+        *result = InvalidCacheEntry;
+        return CRYO_ERR_WRONG_STARTING_BLOCK;
+    }
+
     /* check with hashtable */
     item = hash_search(pagemap, &pageId, HASH_FIND, &found);
 
     if (!found || item->entry == InvalidCacheEntry)
     {
         int i;
-        CacheEntry new_entry;
+        CacheEntry  new_entry;
+        CryoError   err;
 
         /* find available spot in cache or evict old cache entry */
         /* TODO: add LRU strategy */
@@ -198,21 +207,18 @@ cryo_read_block(Relation rel, BlockNumber blockno)
 
         /* load cryo block */
         cache[item->entry].ts = get_current_timestamp_ms();
-        /* TODO: do it with more elegance */
-        PG_TRY();
+
+        err = cryo_read_decompress(rel, blockno, &cache[new_entry].nblocks,
+                                   cache[new_entry].data);
+        if (err != CRYO_ERR_SUCCESS)
         {
-            cryo_read_decompress(rel, blockno, &cache[new_entry].nblocks,
-                                 cache[new_entry].data);
+            *result = item->entry = InvalidCacheEntry;
+            return err;
         }
-        PG_CATCH();
-        {
-            item->entry = InvalidCacheEntry;
-            PG_RE_THROW();
-        }
-        PG_END_TRY();
     }
 
-    return item->entry;
+    *result = item->entry;
+    return CRYO_ERR_SUCCESS;
 }
 
 uint32
@@ -234,11 +240,19 @@ cryo_cache_get_data(CacheEntry entry)
     return header->data;
 }
 
-#if 0
-void
-cryo_release_block(CacheEntry entry)
+char *
+cryo_cache_err(CryoError err)
 {
-    cache[entry].pinned--;
+    switch (errno)
+    {
+        case CRYO_ERR_SUCCESS:
+            return "success";
+        case CRYO_ERR_WRONG_STARTING_BLOCK:
+            return "wrong starting block number";
+        case CRYO_ERR_DECOMPRESSION_FAILED:
+            return "decompression failed";
+        default:
+            return "unknown error";
+    }
 }
-#endif
 

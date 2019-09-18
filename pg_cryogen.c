@@ -77,9 +77,6 @@ void _PG_init(void);
 void
 _PG_init(void)
 {
-    /*
-    modifyState.data = palloc0(CRYO_BLCKSZ);
-    */
     cryo_init_cache();
 }
 
@@ -110,79 +107,30 @@ cryo_compress(const char *data, Size *compressed_size)
 /*
  * Read and reassemble compressed data from the buffer manager starting
  * with `block` and decompress it.
+  *
+ * Possible return values:
+ *      CRYO_ERR_SUCCESS: success;
+ *      CRYO_ERR_WRONG_STARTING_BLOCK: specified blockno is not a starting
+ *          block of cryo page;
+ *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
  */
-static bool
+static CryoError
 cryo_read_data(Relation rel, BlockNumber block, uint32 *nblocks, char *out)
 {
-#if 0
-    Buffer      buf;
-    CryoPageHeader *page;
-    char       *compressed, *p;
-    Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
-    Size        compressed_size, size;
+    CacheEntry  entry;
+    CryoError   err;
 
-    /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
-    if (RelationGetNumberOfBlocks(rel) <= block)
+    err = cryo_read_block(rel, block, &entry);
+    if (err == CRYO_ERR_SUCCESS)
     {
-        cryo_init_page((CryoDataHeader *) out);
-        *nblocks = 0;
-        return true; /* TODO */
-    }
-
-    buf = ReadBuffer(rel, block);
-    page = (CryoPageHeader *) BufferGetPage(buf);
-
-    /*
-     * In case of brin index bitmap scan can try to read data not from the
-     * first page.
-     */
-    if (page->curpage != 0)
-    {
-        ReleaseBuffer(buf);
-        return false;
-    }
-
-    size = compressed_size = page->compressed_size;
-    p = compressed = palloc(compressed_size);
-    if (nblocks)
-        *nblocks = 1;
-
-    while (true)
-    {
-        Size    l = MIN(page_content_size, size);
-        char   *page_content = ((char *) page) + sizeof(CryoPageHeader);
-
-        memcpy(p, page_content, l);
-        p += l;
-        size -= l;
-        ReleaseBuffer(buf);
-
-        if (size == 0)
-            break;
-
-        /* read the next block */
-        buf = ReadBuffer(rel, ++block);
-        page = (CryoPageHeader *) BufferGetPage(buf);
-
         if (nblocks)
-            (*nblocks)++;
-    }
-
-    cryo_decompress(compressed, compressed_size, out);
-
-    return true;
-#endif
-    char *data;
-    CacheEntry entry;
-
-    entry = cryo_read_block(rel, block);
-    if (nblocks)
         *nblocks = cryo_cache_get_pg_nblocks(entry);
 
-    /* TODO: just for test purposes */
-    memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
+        /* TODO: just for test purposes */
+        memcpy(out, cryo_cache_get_data(entry), CRYO_BLCKSZ);
+    }
 
-    return true;
+    return err;
 }
 
 static TableScanDesc
@@ -214,14 +162,20 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
 static bool
 cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
-    CryoScanDesc scan = (CryoScanDesc) sscan;
+    CryoScanDesc    scan = (CryoScanDesc) sscan;
     CryoDataHeader *hdr = (CryoDataHeader *) scan->data;
-    Relation rel = scan->rs_base.rs_rd;
+    Relation        rel = scan->rs_base.rs_rd;
+    CryoError       err;
 
     ExecClearTuple(slot);
 
     if (scan->nblocks == 0)
-        cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+    {
+        /* read the very first page */
+        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        if (err != CRYO_ERR_SUCCESS)
+            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+    }
 
 read_tuple:
     if ((scan->cur_item + 1) * sizeof(CryoItemId) < hdr->lower)
@@ -250,7 +204,10 @@ read_tuple:
         if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
             return false;
 
-        cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        err = cryo_read_data(rel, scan->cur_block, &scan->nblocks, scan->data);
+        if (err != CRYO_ERR_SUCCESS)
+            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+
         scan->cur_item = 0;
         goto read_tuple;
     }
@@ -328,11 +285,14 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
     IndexFetchCryoData *cscan = (IndexFetchCryoData *) scan;
     CryoDataHeader     *hdr = (CryoDataHeader *) cscan->data;
     HeapTuple           tuple;
+    CryoError           err;
 
-    cryo_read_data(cscan->base.rel,
-                   ItemPointerGetBlockNumber(tid),
-                   NULL,
-                   cscan->data);
+    err = cryo_read_data(cscan->base.rel,
+                         ItemPointerGetBlockNumber(tid),
+                         NULL,
+                         cscan->data);
+    if (err != CRYO_ERR_SUCCESS)
+        elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
     tuple = palloc0(sizeof(HeapTupleData));
     tuple->t_tableOid = RelationGetRelid(cscan->base.rel);
@@ -350,16 +310,31 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
 {
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     BlockNumber     blockno;
+    CryoError       err;
 
     /* prevent reading in the middle of cryo blocks */
     if (tbmres->blockno < cscan->cur_block + cscan->nblocks)
         return false;
 
     blockno = tbmres->blockno;
-    if (!cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks,
-                        cscan->data))
+
+    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->nblocks,
+                         cscan->data);
+    switch (err)
     {
-        return false;
+        case CRYO_ERR_SUCCESS:
+            /* everything is fine, carry on */
+            break;
+        case CRYO_ERR_WRONG_STARTING_BLOCK:
+            /*
+             * This is a usual case for BRIN index. It just scans every blockno
+             * in a range. Notify bitmapscan node that there are no tuples in
+             * this block and proceed to the next one.
+             */
+            return false;
+        default:
+            /* some actual error */
+            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
     }
 
     if (cscan->nblocks == 0)
