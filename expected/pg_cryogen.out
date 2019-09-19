@@ -1,0 +1,74 @@
+CREATE EXTENSION pg_cryogen;
+CREATE TEMPORARY TABLE tmp_data
+AS SELECT gs as id, md5(gs::TEXT) as msg FROM generate_series(1, 500) as gs;
+COPY tmp_data TO '/tmp/pg_cryogen_data.csv' WITH csv;
+CREATE TABLE data (id INT4, msg TEXT);
+COPY data FROM '/tmp/pg_cryogen_data.csv' WITH csv;
+SELECT * FROM data LIMIT 10;
+ id |               msg                
+----+----------------------------------
+  1 | c4ca4238a0b923820dcc509a6f75849b
+  2 | c81e728d9d4c2f636f067f89cc14862c
+  3 | eccbc87e4b5ce2fe28308fd9f2a7baf3
+  4 | a87ff679a2f3e71d9181a67b7542122c
+  5 | e4da3b7fbbce2345d7772b0674a318d5
+  6 | 1679091c5a880faf6fb5e6087eb1b2dc
+  7 | 8f14e45fceea167a5a36dedd4bea2543
+  8 | c9f0f895fb98ab9159f51fd0297e236d
+  9 | 45c48cce2e2d7fbdea1afc51c7c6ad26
+ 10 | d3d9446802a44259755d38e6d163e820
+(10 rows)
+
+SELECT avg(id) FROM data;
+         avg          
+----------------------
+ 250.5000000000000000
+(1 row)
+
+SELECT count(*) FROM data;
+ count 
+-------
+   500
+(1 row)
+
+CREATE INDEX data_id_idx ON data USING btree (id);
+SET enable_seqscan = f;
+EXPLAIN (COSTS OFF) SELECT * FROM data WHERE id = 500;
+               QUERY PLAN               
+----------------------------------------
+ Bitmap Heap Scan on data
+   Recheck Cond: (id = 500)
+   ->  Bitmap Index Scan on data_id_idx
+         Index Cond: (id = 500)
+(4 rows)
+
+SELECT * FROM data WHERE id = 500;
+ id  |               msg                
+-----+----------------------------------
+ 500 | cee631121c2ec9232f3a2f028ad5c89b
+(1 row)
+
+DROP INDEX data_id_idx;
+CREATE INDEX data_id_idx ON data USING brin (id);
+EXPLAIN (COSTS OFF) SELECT * FROM data WHERE id = 500;
+               QUERY PLAN               
+----------------------------------------
+ Bitmap Heap Scan on data
+   Recheck Cond: (id = 500)
+   ->  Bitmap Index Scan on data_id_idx
+         Index Cond: (id = 500)
+(4 rows)
+
+SELECT * FROM data WHERE id = 500;
+ id  |               msg                
+-----+----------------------------------
+ 500 | cee631121c2ec9232f3a2f028ad5c89b
+(1 row)
+
+COPY data FROM '/tmp/pg_cryogen_data.csv' WITH csv;
+SELECT count(*) FROM data;
+ count 
+-------
+  1000
+(1 row)
+
