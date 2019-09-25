@@ -139,21 +139,31 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
 static bool
 xid_is_visible(Snapshot snapshot, TransactionId xid)
 {
-	if (TransactionIdIsCurrentTransactionId(xid))
-	{
-			return true;
-	}
-	else if (XidInMVCCSnapshot(xid, snapshot))
-		return false;
-	else if (TransactionIdDidCommit(xid))
-	{
-		return true;
-	}
-	else
-	{
-		/* it must have aborted or crashed */
-		return false;
-	}
+    switch (snapshot->snapshot_type)
+    {
+        case SNAPSHOT_MVCC:
+            if (TransactionIdIsCurrentTransactionId(xid))
+            {
+                    return true;
+            }
+            else if (XidInMVCCSnapshot(xid, snapshot))
+                return false;
+            else if (TransactionIdDidCommit(xid))
+            {
+                return true;
+            }
+            else
+            {
+                /* it must have aborted or crashed */
+                return false;
+            }
+        case SNAPSHOT_ANY:
+            return true;
+        default:
+            elog(ERROR,
+                 "pg_cryogen: visibility check for snapshot type %d is not implemented",
+                 snapshot->snapshot_type);
+    }
 }
 
 static bool
@@ -165,7 +175,7 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
     CryoError       err;
 
     ExecClearTuple(slot);
-
+    /* TODO: handle direction */
 read_block:
     if (scan->cur_item == 0)
     {
@@ -892,37 +902,37 @@ cryo_index_build_range_scan(Relation rel,
     
     reltuples = 0;
 
-	while (cryo_getnextslot(scan, ForwardScanDirection, slot))
-	{
+    while (cryo_getnextslot(scan, ForwardScanDirection, slot))
+    {
         HeapTuple   tuple;
 
-		CHECK_FOR_INTERRUPTS();
+        CHECK_FOR_INTERRUPTS();
 
-		/* Report scan progress, if asked to. */
-		if (progress)
-		{
+        /* Report scan progress, if asked to. */
+        if (progress)
+        {
             /* TODO */
         }
 
         reltuples += 1;
 
-		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+        MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
-		/*
-		 * In a partial index, discard tuples that don't satisfy the
-		 * predicate.
-		 */
-		if (predicate != NULL)
-		{
-			if (!ExecQual(predicate, econtext))
-				continue;
-		}
+        /*
+         * In a partial index, discard tuples that don't satisfy the
+         * predicate.
+         */
+        if (predicate != NULL)
+        {
+            if (!ExecQual(predicate, econtext))
+                continue;
+        }
 
-		FormIndexDatum(indexInfo,
-					   slot,
-					   estate,
-					   values,
-					   isnull);
+        FormIndexDatum(indexInfo,
+                       slot,
+                       estate,
+                       values,
+                       isnull);
 
         /* Call the AM's callback routine to process the tuple */
         tuple = ExecCopySlotHeapTuple(slot);

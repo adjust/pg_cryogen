@@ -9,8 +9,6 @@ DATA = pg_cryogen--0.1.sql
 
 REGRESS = pg_cryogen
 
-EXTRA_CLEAN = sql/pg_cryogen.sql expected/pg_cryogen.out $(REGRESSION_DATA)
-
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
