@@ -15,8 +15,6 @@
 /* TODO: make it configurable via GUC variable */
 #define CACHE_SIZE 16
 
-#define InvalidCacheEntry -1
-
 /* TODO: concatenate headers and put this definition in it */
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 

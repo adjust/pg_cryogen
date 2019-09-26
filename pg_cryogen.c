@@ -132,6 +132,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->cur_item = 0;
     scan->cur_block = 1;
     scan->nblocks = 0;
+    scan->cacheEntry = InvalidCacheEntry;
 
     return (TableScanDesc) scan;
 }
@@ -235,7 +236,12 @@ static void
 cryo_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
             bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
-    NOT_IMPLEMENTED;
+    CryoScanDesc scan = (CryoScanDesc) sscan;
+
+    scan->cur_item = 0;
+    scan->cur_block = 1;
+    scan->nblocks = 0;
+    scan->cacheEntry = InvalidCacheEntry;
 }
 
 static void

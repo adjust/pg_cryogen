@@ -5,6 +5,9 @@
 #include "storage/block.h"
 #include "utils/relcache.h"
 
+
+#define InvalidCacheEntry -1
+
 typedef enum
 {
     CRYO_ERR_SUCCESS = 0,
