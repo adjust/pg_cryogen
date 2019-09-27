@@ -73,7 +73,10 @@ typedef struct CryoModifyState
     char        data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoModifyState;
 
-CryoModifyState modifyState;
+CryoModifyState modifyState = {
+    .metabuf = InvalidBuffer,
+    .tuples_inserted = 0
+};
 
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
@@ -602,34 +605,42 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
     hdr = (CryoDataHeader *) modifyState.data;
 
-    /* initialize modify state */
-    modifyState.metabuf = cryo_load_meta(relation, BUFFER_LOCK_EXCLUSIVE);
-    metapage = (CryoMetaPage *) BufferGetPage(modifyState.metabuf);
-    modifyState.target_block = metapage->target_block;
-
-    if (modifyState.target_block == 0)
+    if (!BufferIsValid(modifyState.metabuf))
     {
-        /* This is a first data block in the relation */
-        cryo_init_page(hdr);
-        modifyState.target_block = 1;
-    }
-    else
-    {
-#ifdef ONE_WRITE_ONE_BLOCK
         /* 
-         * In order to ensure that storage is  consistent we create entirely
-         * new block for every multi_insert instead of adding tuples to an
-         * existing one. This also makes visibility check much simpler and
-         * faster: we just check transaction id in a block header.
+         * TODO: probably we don't want to lock buffer exclusevely until we
+         * actually about to start writing to disk. Share lock seems to be
+         * enough here
          */
-        cryo_init_page(hdr);
+        modifyState.metabuf = cryo_load_meta(relation, BUFFER_LOCK_EXCLUSIVE);
+        metapage = (CryoMetaPage *) BufferGetPage(modifyState.metabuf);
+        modifyState.target_block = metapage->target_block;
+
+        /* initialize modify state */
+        if (modifyState.target_block == 0)
+        {
+            /* This is a first data block in the relation */
+            cryo_init_page(hdr);
+            modifyState.target_block = 1;
+        }
+        else
+        {
+#ifdef ONE_WRITE_ONE_BLOCK
+            /* 
+             * In order to ensure that storage is  consistent we create entirely
+             * new block for every multi_insert instead of adding tuples to an
+             * existing one. This also makes visibility check much simpler and
+             * faster: we just check transaction id in a block header.
+             */
+            cryo_init_page(hdr);
 #else
-        /* Read the target block contents into modifyState.data */
-        cryo_read_data(relation, modifyState.target_block,  modifyState.data);
+            /* Read the target block contents into modifyState.data */
+            cryo_read_data(relation, modifyState.target_block,  modifyState.data);
 #endif
+        }
+        modifyState.relation = relation;
+        modifyState.tuples_inserted = 0;
     }
-    modifyState.relation = relation;
-    modifyState.tuples_inserted = 0;
 
     for (i = 0; i < ntuples; ++i)
     {
@@ -660,7 +671,11 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
         /* position in item pointer starts with 1 */
         ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
     }
+}
 
+static void
+cryo_finish_bulk_insert(Relation rel, int options)
+{
 #ifdef ONE_WRITE_ONE_BLOCK
     /*
      * Advance target_block so that next tuple will be written into a new
@@ -674,11 +689,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
     UnlockReleaseBuffer(modifyState.metabuf);
     modifyState.tuples_inserted = 0;
-}
-
-static void
-cryo_finish_bulk_insert(Relation rel, int options)
-{
+    modifyState.metabuf = InvalidBuffer;
 }
 
 static TM_Result
