@@ -54,6 +54,7 @@ typedef struct CryoScanDescData
     uint32              nblocks;
     BlockNumber         cur_block;
     uint32              cur_item;
+    BlockNumber         target_block;
     CacheEntry          cacheEntry; /* cached decompressed page reference */
 } CryoScanDescData;
 typedef CryoScanDescData *CryoScanDesc;
@@ -80,6 +81,7 @@ CryoModifyState modifyState = {
 
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
+static Buffer cryo_load_meta(Relation rel, int lockmode);
 
 void _PG_init(void);
 
@@ -120,6 +122,8 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
                uint32 flags)
 {
     CryoScanDesc    scan;
+    Buffer          metabuf;
+    CryoMetaPage   *metapage;
 
 	RelationIncrementReferenceCount(relation);
 
@@ -136,6 +140,11 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->cur_block = 1;
     scan->nblocks = 0;
     scan->cacheEntry = InvalidCacheEntry;
+
+    metabuf = cryo_load_meta(relation, BUFFER_LOCK_SHARE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+    scan->target_block = metapage->target_block;
+    UnlockReleaseBuffer(metabuf);
 
     return (TableScanDesc) scan;
 }
@@ -179,7 +188,11 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
     CryoError       err;
 
     ExecClearTuple(slot);
+
     /* TODO: handle direction */
+    if (direction == BackwardScanDirection)
+        elog(ERROR, "pg_cryogen: backward scan is not implemented");
+
 read_block:
     if (scan->cur_item == 0)
     {
@@ -189,8 +202,8 @@ read_block:
          */
         scan->cur_block += scan->nblocks;
 
-        /* TODO: use metapage->target_block instead of number of blocks */
-        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
+        /* Reach the end of relation? */
+        if (scan->target_block <= scan->cur_block)
             return false;
 
         err = cryo_read_data(rel, scan->cur_block, &scan->cacheEntry);
@@ -309,6 +322,10 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
     err = cryo_read_data(cscan->base.rel,
                          ItemPointerGetBlockNumber(tid),
                          &cscan->cacheEntry);
+
+    if (!xid_is_visible(snapshot, cryo_cache_get_xid(cscan->cacheEntry)))
+        return false;
+
     hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
         elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
@@ -388,11 +405,14 @@ cryo_scan_bitmap_next_tuple(TableScanDesc scan,
     HeapTuple tuple;
     int     pos; 
 
-    hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
-
     /* prevent reading in the middle of cryo blocks */
     if (tbmres->blockno != cscan->cur_block)
         return false;
+
+    if (!xid_is_visible(scan->rs_snapshot, cryo_cache_get_xid(cscan->cacheEntry)))
+        return false;
+
+    hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
 
     if (tbmres->ntuples >= 0)
     {
@@ -646,6 +666,8 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
     {
         HeapTuple   tuple;
         int         pos;
+
+        CHECK_FOR_INTERRUPTS();
 
         tuple = ExecCopySlotHeapTuple(slots[i]);
         if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
