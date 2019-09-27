@@ -68,7 +68,7 @@ typedef struct CryoModifyState
 {
     Relation    relation;
     BlockNumber target_block;
-    bool        modified;
+    uint32      tuples_inserted;
     Buffer      metabuf;
     char        data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoModifyState;
@@ -441,7 +441,7 @@ cryo_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 }
 
 static Buffer
-cryo_load_meta(Relation rel)
+cryo_load_meta(Relation rel, int lockmode)
 {
     Buffer          metabuf;
     CryoMetaPage   *metapage;
@@ -474,9 +474,7 @@ cryo_load_meta(Relation rel)
     }
 
     metabuf = ReadBuffer(rel, CRYO_META_PAGE);
-    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-    LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-    modifyState.target_block = metapage->target_block;
+    LockBuffer(metabuf, lockmode);
 
     return metabuf;
 }
@@ -580,6 +578,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
         block += i;
 #endif
     metapage->target_block = state->target_block = block;
+    metapage->ntuples += state->tuples_inserted;
     MarkBufferDirty(state->metabuf);
     GenericXLogFinish(xlog_state);
 
@@ -598,12 +597,16 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                   CommandId cid, int options, BulkInsertState bistate)
 {
     CryoDataHeader *hdr;
+    CryoMetaPage   *metapage;
     int             i;
 
     hdr = (CryoDataHeader *) modifyState.data;
 
     /* initialize modify state */
-    modifyState.metabuf = cryo_load_meta(relation);
+    modifyState.metabuf = cryo_load_meta(relation, BUFFER_LOCK_EXCLUSIVE);
+    metapage = (CryoMetaPage *) BufferGetPage(modifyState.metabuf);
+    modifyState.target_block = metapage->target_block;
+
     if (modifyState.target_block == 0)
     {
         /* This is a first data block in the relation */
@@ -626,7 +629,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 #endif
     }
     modifyState.relation = relation;
-    modifyState.modified = false;
+    modifyState.tuples_inserted = 0;
 
     for (i = 0; i < ntuples; ++i)
     {
@@ -640,10 +643,10 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
              * Compress and flush current block to the disk (if needed),
              * create a new one and retry insertion
              */
-            if (modifyState.modified)
+            if (modifyState.tuples_inserted != 0)
             {
                 cryo_preserve(&modifyState, true);
-                modifyState.modified = false;
+                modifyState.tuples_inserted = 0;
             }
             cryo_init_page(hdr);
             if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
@@ -651,7 +654,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                 elog(ERROR, "tuple is too large to fit the cryo block");
             }
         }
-        modifyState.modified = true;
+        modifyState.tuples_inserted++;
 
         slots[i]->tts_tableOid = RelationGetRelid(relation);
         /* position in item pointer starts with 1 */
@@ -670,7 +673,7 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 #endif
 
     UnlockReleaseBuffer(modifyState.metabuf);
-    modifyState.modified = false;
+    modifyState.tuples_inserted = 0;
 }
 
 static void
@@ -1011,10 +1014,18 @@ cryo_estimate_rel_size(Relation rel, int32 *attr_widths,
                          BlockNumber *pages, double *tuples,
                          double *allvisfrac)
 {
+    Buffer          metabuf;
+    CryoMetaPage   *metapage;
+
+    metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+
     /* TODO */
     *pages = 0;
-    *tuples = 0;
+    *tuples = metapage->ntuples;
     *allvisfrac = 0;
+
+    UnlockReleaseBuffer(metabuf);
 }
 
 static bool

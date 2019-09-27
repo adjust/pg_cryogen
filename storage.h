@@ -9,14 +9,15 @@
  * XXX probably it makes sense to make page size configurable for each table
  * but that would require more complex solution for cache
  */
-//#define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
-#define CRYO_BLCKSZ (1 << 16)   /* 64Kb */
+#define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
+//#define CRYO_BLCKSZ (1 << 16)   /* 64Kb */
 
 typedef struct
 {
     PageHeaderData base;    /* to keep PageIsVerified quiet */
     uint32  target_block;   /* the last block we inserted to;
                              * zero if we haven't yet */
+    uint64  ntuples;        /* total number of tuples in relation */
 } CryoMetaPage;
 
 /*
