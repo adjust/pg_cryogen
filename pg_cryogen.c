@@ -698,16 +698,22 @@ cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 static void
 cryo_finish_bulk_insert(Relation rel, int options)
 {
+    if (!RelationIsValid(rel))
+        return;
+
+    if (modifyState.tuples_inserted)
+    {
 #ifdef ONE_WRITE_ONE_BLOCK
-    /*
-     * Advance target_block so that next tuple will be written into a new
-     * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
-     * details.
-     */
-    cryo_preserve(&modifyState, true);
+        /*
+         * Advance target_block so that next tuple will be written into a new
+         * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
+         * details.
+         */
+        cryo_preserve(&modifyState, true);
 #else
-    cryo_preserve(&modifyState, false);
+        cryo_preserve(&modifyState, false);
 #endif
+    }
 
     UnlockReleaseBuffer(modifyState.metabuf);
     modifyState.tuples_inserted = 0;
