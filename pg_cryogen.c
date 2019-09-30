@@ -332,7 +332,7 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
 
     tuple = palloc0(sizeof(HeapTupleData));
     tuple->t_tableOid = RelationGetRelid(cscan->base.rel);
-    tuple->t_self = *tid;
+    ItemPointerCopy(tid, &tuple->t_self);
     cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid), tuple);
 
     ExecStoreHeapTuple(tuple, slot, true);
@@ -743,7 +743,32 @@ cryo_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
                   LockWaitPolicy wait_policy, uint8 flags,
                   TM_FailureData *tmfd)
 {
-    NOT_IMPLEMENTED;
+    CryoDataHeader *hdr;
+    CryoError       err;
+    CacheEntry      cacheEntry;
+    HeapTuple       tuple;
+
+    err = cryo_read_data(relation, ItemPointerGetBlockNumber(tid), &cacheEntry);
+    if (err != CRYO_ERR_SUCCESS)
+        elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+
+    if (!xid_is_visible(snapshot, cryo_cache_get_xid(cacheEntry)))
+        return TM_Invisible;
+
+    hdr = (CryoDataHeader *) cryo_cache_get_data(cacheEntry);
+
+    tuple = palloc0(sizeof(HeapTupleData));
+    cryo_storage_fetch(hdr, ItemPointerGetOffsetNumber(tid), tuple);
+    tuple->t_tableOid = RelationGetRelid(relation);
+    ItemPointerCopy(tid, &tuple->t_self);
+
+    ExecStoreHeapTuple(tuple, slot, true);
+
+    /*
+     * We don't do any actual locking since data is not going anywhere as it's
+     * an append-only storage
+     */
+    return TM_Ok;
 }
 
 static void
