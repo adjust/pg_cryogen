@@ -3,6 +3,7 @@
 #include "cache.h"
 #include "storage.h"
 
+#include "access/visibilitymap.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
 #include "utils/catcache.h"
@@ -113,10 +114,12 @@ static CryoError
 cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
 {
     Buffer      buf;
+    Buffer      vmbuf = InvalidBuffer;
     CryoPageHeader *page;
     char       *compressed, *p;
     Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
     Size        compressed_size, size;
+    uint8       vmflags;
 
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
@@ -134,7 +137,20 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
     size = compressed_size = page->compressed_size;
     p = compressed = palloc(compressed_size);
     entry->nblocks = 1;
-    entry->xid = page->created_xid;
+
+    /*
+     * Check whether page is frozen.
+     *
+     * XXX We don't actually write FrozenTransactionId into page header as this
+     * would require entire page copy to WAL (due to Generic WAL), and VACUUM
+     * would be very write heavy. Instead we just write frozen bit into
+     * visibility map.
+     */
+    vmflags = visibilitymap_get_status(rel, block, &vmbuf);
+    entry->xid = (vmflags & VISIBILITYMAP_ALL_FROZEN) ?
+        FrozenTransactionId : page->created_xid;
+    if (BufferIsValid(vmbuf))
+        ReleaseBuffer(vmbuf);
 
     while (true)
     {

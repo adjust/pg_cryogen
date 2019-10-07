@@ -6,6 +6,7 @@
 #include "access/relscan.h"
 #include "access/skey.h"
 #include "access/tableam.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
@@ -156,18 +157,14 @@ xid_is_visible(Snapshot snapshot, TransactionId xid)
     {
         case SNAPSHOT_MVCC:
             if (TransactionIdIsCurrentTransactionId(xid))
-            {
-                    return true;
-            }
+                return true;
             else if (XidInMVCCSnapshot(xid, snapshot))
                 return false;
             else if (TransactionIdDidCommit(xid))
-            {
                 return true;
-            }
             else
             {
-                /* it must have aborted or crashed */
+                /* it must have been aborted or crashed */
                 return false;
             }
         case SNAPSHOT_ANY:
@@ -484,8 +481,8 @@ cryo_load_meta(Relation rel, int lockmode)
          * Can't leave pd_upper = 0 because then page will be considered new
          * (see PageIsNew) and won't pass PageIsVerified check
          */
-        metapage->base.pd_upper = sizeof(CryoPageHeader);
-        metapage->base.pd_lower = metapage->base.pd_upper;
+        metapage->base.pd_upper = BLCKSZ;
+        metapage->base.pd_lower = sizeof(CryoPageHeader);
         metapage->base.pd_special = BLCKSZ;
 
         /* No target block yet */
@@ -578,7 +575,8 @@ cryo_preserve(CryoModifyState *state, bool advance)
          * Can't leave pd_upper = 0 because then page will be considered new
          * (see PageIsNew) and won't pass PageIsVerified check
          */
-        hdr->base.pd_upper = hdr->base.pd_lower = sizeof(CryoPageHeader);
+        hdr->base.pd_upper = BLCKSZ;
+        hdr->base.pd_lower = sizeof(CryoPageHeader) + MIN(page_content_size, size);
         hdr->base.pd_special = BLCKSZ;
         memcpy((char *) hdr + sizeof(CryoPageHeader),
                p,
@@ -1109,7 +1107,67 @@ static void
 cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                 BufferAccessStrategy bstrategy)
 {
-    NOT_IMPLEMENTED;
+    int         npages = RelationGetNumberOfBlocks(onerel);
+    BlockNumber blkno;
+    TransactionId   oldest_xmin, freeze_limit, xid_full_scan_limit;
+    MultiXactId     multi_xact_cutoff, multi_xact_full_scan_limit;
+
+    if (params->options & VACOPT_FULL)
+        elog(ERROR, "pg_cryogen: VACUUM FULL is not implemented");
+
+    /*
+     * This is append only storage so only VACUUM FREEZE makes sense. In other
+     * cases just bail out.
+     */
+    if (!(params->options & VACOPT_FREEZE))
+        return;
+
+    vacuum_set_xid_limits(onerel,
+                          params->freeze_min_age,
+                          params->freeze_table_age,
+                          params->multixact_freeze_min_age,
+                          params->multixact_freeze_table_age,
+                          &oldest_xmin, &freeze_limit, &xid_full_scan_limit,
+                          &multi_xact_cutoff, &multi_xact_full_scan_limit);
+
+    for (blkno = 1; blkno < npages; ++blkno)
+    {
+        Buffer          buf;
+        Buffer          vmbuf = InvalidBuffer;
+        CryoPageHeader *page;
+        uint8           vmflags;
+
+        buf = ReadBuffer(onerel, blkno);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = (CryoPageHeader *) BufferGetPage(buf);
+
+        /* TODO: probably use VM_ALL_FROZEN */
+        vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
+        /* TODO: need pin? */
+
+        if (!(vmflags & VISIBILITYMAP_ALL_FROZEN))
+        {
+            if (TransactionIdPrecedes(page->created_xid, freeze_limit))
+            //if (cryo_page_needs_freeze(page, freeze_limit))
+            {
+                /* Freeze page by setting bit in visibility map */ 
+                visibilitymap_pin(onerel, blkno, &vmbuf);
+
+                if (!BufferIsValid(vmbuf))
+                    elog(ERROR,
+                         "pg_cryogen: failed to pin visibility map buffer for block %d of relation '%s'",
+                         blkno, RelationGetRelationName(onerel));
+
+                vmflags |= VISIBILITYMAP_ALL_FROZEN;
+                visibilitymap_set(onerel, blkno, buf, InvalidXLogRecPtr,
+                                  vmbuf, freeze_limit, vmflags);
+            }
+        }
+
+        if (BufferIsValid(vmbuf))
+            ReleaseBuffer(vmbuf);
+        UnlockReleaseBuffer(buf);
+    }
 }
 
 /*
