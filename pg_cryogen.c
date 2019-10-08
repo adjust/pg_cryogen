@@ -138,7 +138,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->rs_base.rs_nkeys = nkeys;
     scan->rs_base.rs_flags = flags;
     scan->cur_item = 0;
-    scan->cur_block = 1;
+    scan->cur_block = 0;
     scan->nblocks = 0;
     scan->cacheEntry = InvalidCacheEntry;
 
@@ -193,6 +193,8 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
 read_block:
     if (scan->cur_item == 0)
     {
+        scan->cur_block = MAX(1, scan->cur_block);  /* initial case */
+
         /*
          * Either it's a first block to scan or there are no more tuples in the
          * current block. Proceed to the next one,
@@ -252,7 +254,7 @@ cryo_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
     CryoScanDesc scan = (CryoScanDesc) sscan;
 
     scan->cur_item = 0;
-    scan->cur_block = 1;
+    scan->cur_block = 0;
     scan->nblocks = 0;
     scan->cacheEntry = InvalidCacheEntry;
 }
@@ -320,12 +322,13 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
                          ItemPointerGetBlockNumber(tid),
                          &cscan->cacheEntry);
 
+    if (err != CRYO_ERR_SUCCESS)
+        elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+
     if (!xid_is_visible(snapshot, cryo_cache_get_xid(cscan->cacheEntry)))
         return false;
 
     hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
-    if (err != CRYO_ERR_SUCCESS)
-        elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
     tuple = palloc0(sizeof(HeapTupleData));
     tuple->t_tableOid = RelationGetRelid(cscan->base.rel);
@@ -344,6 +347,8 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     BlockNumber     blockno;
     CryoError       err;
+
+    cscan->cur_block = MAX(1, cscan->cur_block);  /* initial case */
 
     /* prevent reading in the middle of cryo blocks */
     if (tbmres->blockno < cscan->cur_block + cscan->nblocks)
@@ -894,7 +899,44 @@ static bool
 cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
                              BufferAccessStrategy bstrategy)
 {
-    NOT_IMPLEMENTED;
+    CryoPageHeader *page;
+    CryoScanDesc    cscan = (CryoScanDesc) scan;
+    Buffer          buf;
+    CryoError       err;
+
+    /* Skip metapage */
+    if (blockno == 0)
+        return false;
+
+    /*
+     * pg_cryogen's page layout doesn't really fits into postgres sampler's
+     * views on page layout. So we need to improvise a bit. Whenever sampler
+     * asks for block which is not the first page of cryo block we find the
+     * first page and decompress cryo block starting with this page.
+     */
+    buf = ReadBuffer(cscan->rs_base.rs_rd, blockno);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = (CryoPageHeader *) BufferGetPage(buf);
+    blockno = blockno - page->curpage;
+    UnlockReleaseBuffer(buf);
+
+    /* Do not scan the same block twice */
+    if (blockno == cscan->cur_block)
+        return false;
+
+    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->cacheEntry);
+    if (err != CRYO_ERR_SUCCESS)
+        elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+
+    /*
+     * XXX scan->rs_snapshot is NULL here so visibility is checked in
+     * cryo_scan_analyze_next_tuple() by comparing block xid with OldestXmin
+     */
+
+    cscan->cur_block = blockno;
+    cscan->cur_item = 1;
+
+    return true;
 }
 
 static bool
@@ -902,7 +944,39 @@ cryo_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
                              double *liverows, double *deadrows,
                              TupleTableSlot *slot)
 {
-    NOT_IMPLEMENTED;
+    CryoScanDesc    cscan = (CryoScanDesc) scan;
+    CryoDataHeader *hdr;
+    TransactionId   xid;
+
+    /*
+     * TODO: it's a sketchy solution, should think more thoroughly. But the
+     * idea is that we only consider blocks that have been created before any
+     * running transaction started and corresponding transaction did actually
+     * commit. Otherwise skip the entire block.
+     */
+    xid = cryo_cache_get_xid(cscan->cacheEntry);
+    if (!TransactionIdPrecedes(xid, OldestXmin) || !TransactionIdDidCommit(xid))
+        return false;
+
+    hdr = (CryoDataHeader *) cryo_cache_get_data(cscan->cacheEntry);
+
+    if ((cscan->cur_item) * sizeof(CryoItemId) < hdr->lower)
+    {
+        HeapTuple tuple;
+
+        tuple = palloc0(sizeof(HeapTupleData));
+        cryo_storage_fetch(hdr, cscan->cur_item, tuple);
+        tuple->t_tableOid = RelationGetRelid(cscan->rs_base.rs_rd);
+        ItemPointerSet(&tuple->t_self, cscan->cur_block, cscan->cur_item);
+
+        ExecStoreHeapTuple(tuple, slot, true);
+        cscan->cur_item++;
+        (*liverows)++;
+
+        return true;
+    }
+
+    return false;
 }
 
 static double
