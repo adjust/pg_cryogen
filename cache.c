@@ -117,7 +117,6 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
     Buffer      vmbuf = InvalidBuffer;
     CryoPageHeader *page;
     char       *compressed, *p;
-    Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
     Size        compressed_size, size;
     uint8       vmflags;
 
@@ -134,7 +133,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
         return CRYO_ERR_WRONG_STARTING_BLOCK;
     }
 
-    size = compressed_size = page->compressed_size;
+    size = compressed_size = ((CryoFirstPageHeader *) page)->compressed_size;
     p = compressed = palloc(compressed_size);
     entry->nblocks = 1;
 
@@ -148,14 +147,15 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
      */
     vmflags = visibilitymap_get_status(rel, block, &vmbuf);
     entry->xid = (vmflags & VISIBILITYMAP_ALL_FROZEN) ?
-        FrozenTransactionId : page->created_xid;
+        FrozenTransactionId : ((CryoFirstPageHeader *) page)->created_xid;
     if (BufferIsValid(vmbuf))
         ReleaseBuffer(vmbuf);
 
     while (true)
     {
-        Size    l = MIN(page_content_size, size);
-        char   *page_content = ((char *) page) + sizeof(CryoPageHeader);
+        Size    content_size = BLCKSZ - CryoPageHeaderSize(page);
+        Size    l = MIN(content_size, size);
+        char   *page_content = ((char *) page) + CryoPageHeaderSize(page);
 
         memcpy(p, page_content, l);
         p += l;

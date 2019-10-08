@@ -490,7 +490,6 @@ cryo_load_meta(Relation rel, int lockmode)
 
         GenericXLogFinish(xlogState);
         UnlockReleaseBuffer(metabuf);
-        //MarkBufferDirty(metabuf); -- done automatically by GenericXLogFinish()
     }
 
     metabuf = ReadBuffer(rel, CRYO_META_PAGE);
@@ -522,6 +521,27 @@ cryo_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 }
 
 /*
+ * Number of postgres pages needed to fit data block of the specified size.
+ */
+static inline uint8
+cryo_pages_needed(Size size)
+{
+    int     pages = 1;
+
+    Assert(size > 0);
+
+    size -= BLCKSZ - sizeof(CryoFirstPageHeader);
+
+    while (size > 0)
+    {
+        size -= MIN(BLCKSZ - sizeof(CryoPageHeader), size);
+        pages++;
+    }
+
+    return pages;
+};
+
+/*
  * Compress and store data in postgres buffers, write WAL and all that stuff.
  * If advance flag is set true, then also shift target_block of the state to
  * the next block after the last written page.
@@ -534,7 +554,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
     Relation    rel = state->relation;
     Size        size;
     char       *compressed, *p;
-    Size        page_content_size = BLCKSZ - sizeof(CryoPageHeader);
     int         npages;
     Buffer     *buffers;
     int         i;
@@ -543,7 +562,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
     p = compressed = cryo_compress(state->data, &size);
 
     /* split data into pages */
-    npages = (size + page_content_size - 1) / page_content_size; /* round up */
+    npages = cryo_pages_needed(size);
     buffers = palloc(npages * sizeof(Buffer));
 
     block = MAX(1, block);
@@ -561,29 +580,41 @@ cryo_preserve(CryoModifyState *state, bool advance)
     for (i = 0; i < npages; ++i)
     {
         CryoPageHeader *hdr;
+        Size        hdr_size;
+        Size        content_size;
 
         xlog_state = GenericXLogStart(state->relation);
         hdr = (CryoPageHeader *)
             GenericXLogRegisterBuffer(xlog_state, buffers[i],
                                       GENERIC_XLOG_FULL_IMAGE);
-        hdr->npages = npages;
         hdr->curpage = i;
-        hdr->compressed_size = size;
-        hdr->created_xid = GetCurrentTransactionId();
+
+        /* write additional info into the first page */
+        if (i == 0)
+        {
+            CryoFirstPageHeader *first_hdr = (CryoFirstPageHeader *) hdr;
+
+            first_hdr->npages = npages;
+            first_hdr->compressed_size = size;
+            first_hdr->created_xid = GetCurrentTransactionId();
+        }
+        hdr_size = CryoPageHeaderSize(hdr);
+        content_size = BLCKSZ - hdr_size;
+
         hdr->base.pd_checksum = 0; /* TODO */
         /*
          * Can't leave pd_upper = 0 because then page will be considered new
          * (see PageIsNew) and won't pass PageIsVerified check
          */
         hdr->base.pd_upper = BLCKSZ;
-        hdr->base.pd_lower = sizeof(CryoPageHeader) + MIN(page_content_size, size);
+        hdr->base.pd_lower = hdr_size + MIN(content_size, size);
         hdr->base.pd_special = BLCKSZ;
-        memcpy((char *) hdr + sizeof(CryoPageHeader),
+        memcpy((char *) hdr + hdr_size,
                p,
-               MIN(page_content_size, size));
+               MIN(content_size, size));
 
-        size -= page_content_size;
-        p += page_content_size;
+        size -= content_size;
+        p += content_size;
 
         MarkBufferDirty(buffers[i]);
         GenericXLogFinish(xlog_state);
@@ -1115,13 +1146,6 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
     if (params->options & VACOPT_FULL)
         elog(ERROR, "pg_cryogen: VACUUM FULL is not implemented");
 
-    /*
-     * This is append only storage so only VACUUM FREEZE makes sense. In other
-     * cases just bail out.
-     */
-    if (!(params->options & VACOPT_FREEZE))
-        return;
-
     vacuum_set_xid_limits(onerel,
                           params->freeze_min_age,
                           params->freeze_table_age,
@@ -1130,25 +1154,24 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                           &oldest_xmin, &freeze_limit, &xid_full_scan_limit,
                           &multi_xact_cutoff, &multi_xact_full_scan_limit);
 
-    for (blkno = 1; blkno < npages; ++blkno)
+    while (blkno < npages)
     {
-        Buffer          buf;
-        Buffer          vmbuf = InvalidBuffer;
-        CryoPageHeader *page;
-        uint8           vmflags;
+        CryoFirstPageHeader *page;
+        Buffer      buf;
+        Buffer      vmbuf = InvalidBuffer;
+        uint8       vmflags;
 
         buf = ReadBuffer(onerel, blkno);
         LockBuffer(buf, BUFFER_LOCK_SHARE);
-        page = (CryoPageHeader *) BufferGetPage(buf);
+        page = (CryoFirstPageHeader *) BufferGetPage(buf);
 
-        /* TODO: probably use VM_ALL_FROZEN */
+        Assert(page->cryo_base.curpage == 0);
+
         vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
-        /* TODO: need pin? */
 
         if (!(vmflags & VISIBILITYMAP_ALL_FROZEN))
         {
             if (TransactionIdPrecedes(page->created_xid, freeze_limit))
-            //if (cryo_page_needs_freeze(page, freeze_limit))
             {
                 /* Freeze page by setting bit in visibility map */ 
                 visibilitymap_pin(onerel, blkno, &vmbuf);
@@ -1167,6 +1190,8 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         if (BufferIsValid(vmbuf))
             ReleaseBuffer(vmbuf);
         UnlockReleaseBuffer(buf);
+
+        blkno += page->npages;
     }
 }
 

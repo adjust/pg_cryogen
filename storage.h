@@ -22,18 +22,28 @@ typedef struct
 
 /*
  * Compressed cryo page maps to several postgres blocks. Each block has
- * a simple header containing starting block number and relative block number
- * relative to the starting one.
+ * a simple header containing block number relative to the starting one.
  */
 typedef struct
 {
     PageHeaderData base;    /* we don't use it, but it is required by
                              * GenericXLogFinish() */
-    uint16  npages;         /* number of pages for this cryo block */
     uint16  curpage;
+} CryoPageHeader;
+
+/*
+ * First cryo page also contains additional metadata on compressed cryo block.
+ */
+typedef struct
+{
+    CryoPageHeader cryo_base;
+    uint16  npages;         /* number of pages for this cryo block */
     uint32  compressed_size;
     TransactionId created_xid; /* transaction performed insertion */
-} CryoPageHeader;
+} CryoFirstPageHeader;
+
+#define CryoPageHeaderSize(page) \
+    ((page)->curpage == 0 ? sizeof(CryoFirstPageHeader) : sizeof(CryoPageHeader))
 
 /* */
 typedef struct
