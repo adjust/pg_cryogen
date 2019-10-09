@@ -469,8 +469,9 @@ cryo_load_meta(Relation rel, int lockmode)
          * (see PageIsNew) and won't pass PageIsVerified check
          */
         metapage->base.pd_upper = BLCKSZ;
-        metapage->base.pd_lower = sizeof(CryoPageHeader);
+        metapage->base.pd_lower = sizeof(CryoMetaPage);
         metapage->base.pd_special = BLCKSZ;
+        metapage->version = STORAGE_VERSION;
 
         /* No target block yet */
         metapage->target_block = 0;
@@ -546,7 +547,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
     int         i;
     BlockNumber block = state->target_block;
 
-    p = compressed = cryo_compress(state->data, &size);
+    p = compressed = cryo_compress(COMP_LZ4, state->data, &size);
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
@@ -582,6 +583,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
             CryoFirstPageHeader *first_hdr = (CryoFirstPageHeader *) hdr;
 
             first_hdr->npages = npages;
+            first_hdr->compression_method = COMP_LZ4; /* TODO */
             first_hdr->compressed_size = size;
             first_hdr->created_xid = GetCurrentTransactionId();
         }

@@ -2,10 +2,11 @@
 #include "compression.h"
 
 #include "lz4.h"
+#include "zstd.h"
 
 
-char *
-cryo_compress(const char *data, Size *compressed_size)
+static char *
+lz4_compress(const char *data, Size *compressed_size)
 {
     Size    estimate;
     char   *compressed;
@@ -21,11 +22,8 @@ cryo_compress(const char *data, Size *compressed_size)
     return compressed;
 }
 
-/*
- * Decompress and store result in `out`
- */
-bool
-cryo_decompress(const char *compressed, Size compressed_size, char *out)
+static bool
+lz4_decompress(const char *compressed, Size compressed_size, char *out)
 {
     int bytes;
 
@@ -36,5 +34,72 @@ cryo_decompress(const char *compressed, Size compressed_size, char *out)
     Assert(CRYO_BLCKSZ == bytes);
 
     return true;
+}
+
+static char *
+zstd_compress(const char *data, Size *compressed_size)
+{
+    Size    estimate;
+    char   *compressed;
+
+    estimate = ZSTD_compressBound(CRYO_BLCKSZ);
+    compressed = palloc(estimate);
+
+    *compressed_size = ZSTD_compress(compressed, estimate,
+                                     data, CRYO_BLCKSZ, 22);
+    if (*compressed_size == 0)
+        elog(ERROR, "pg_cryogen: compression failed");
+
+    return compressed;
+}
+
+static bool
+zstd_decompress(const char *compressed, Size compressed_size, char *out)
+{
+    int bytes;
+
+    bytes = ZSTD_decompress(out, CRYO_BLCKSZ, compressed, compressed_size);
+    if (bytes < 0)
+        return false;
+
+    Assert(CRYO_BLCKSZ == bytes);
+
+    return true;
+}
+
+char *
+cryo_compress(CompressionMethod method,
+              const char *data,
+              Size *compressed_size)
+{
+    switch (method)
+    {
+        case COMP_LZ4:
+            return lz4_compress(data, compressed_size);
+        case COMP_ZSTD:
+            return zstd_compress(data, compressed_size);
+        default:
+            elog(ERROR, "pg_cryogen: unknown compression method");
+    }
+}
+
+/*
+ * Decompress and store result in `out`
+ */
+bool
+cryo_decompress(CompressionMethod method,
+                const char *compressed,
+                Size compressed_size,
+                char *out)
+{
+    switch (method)
+    {
+        case COMP_LZ4:
+            return lz4_decompress(compressed, compressed_size, out);
+        case COMP_ZSTD:
+            return zstd_decompress(compressed, compressed_size, out);
+        default:
+            elog(ERROR, "pg_cryogen: unknown compression method");
+    }
 }
 

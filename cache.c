@@ -153,7 +153,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
         entry->nblocks++;
     }
 
-    if (!cryo_decompress(compressed, compressed_size, entry->data))
+    if (!cryo_decompress(COMP_LZ4, compressed, compressed_size, entry->data))
         return CRYO_ERR_DECOMPRESSION_FAILED;
 
     return CRYO_ERR_SUCCESS;
