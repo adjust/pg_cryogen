@@ -22,9 +22,8 @@
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
-#include "lz4.h"
-
 #include "cache.h"
+#include "compression.h"
 #include "storage.h"
 
 
@@ -97,23 +96,6 @@ cryo_slot_callbacks(Relation relation)
 {
 //    return &TTSOpsBufferHeapTuple;
     return &TTSOpsHeapTuple;
-}
-
-static char *
-cryo_compress(const char *data, Size *compressed_size)
-{
-    Size    estimate;
-    char   *compressed;
-
-    estimate = LZ4_compressBound(CRYO_BLCKSZ);
-    compressed = palloc(estimate);
-
-    *compressed_size = LZ4_compress_fast(data, compressed,
-                                         CRYO_BLCKSZ, estimate, 0);
-    if (*compressed_size == 0)
-        elog(ERROR, "pg_cryogen: compression failed");
-
-    return compressed;
 }
 
 static TableScanDesc

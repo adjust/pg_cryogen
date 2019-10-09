@@ -1,6 +1,7 @@
 #include <sys/time.h>
 
 #include "cache.h"
+#include "compression.h"
 #include "storage.h"
 
 #include "access/visibilitymap.h"
@@ -9,8 +10,6 @@
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
-
-#include "lz4.h"
 
 
 /* TODO: make it configurable via GUC variable */
@@ -79,23 +78,6 @@ get_current_timestamp_ms(void)
 
     return (TS)(tv.tv_sec) * 1000 +
            (TS)(tv.tv_usec) / 1000;
-}
-
-/*
- * Decompress and store result in `out`
- */
-static bool
-cryo_decompress(const char *compressed, Size compressed_size, char *out)
-{
-    int bytes;
-
-    bytes = LZ4_decompress_safe(compressed, out, compressed_size, CRYO_BLCKSZ);
-    if (bytes < 0)
-        return false;
-
-    Assert(CRYO_BLCKSZ == bytes);
-
-    return true;
 }
 
 /*
