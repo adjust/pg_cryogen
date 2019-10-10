@@ -535,7 +535,7 @@ cryo_pages_needed(Size size)
 
     Assert(size > 0);
 
-    size -= BLCKSZ - sizeof(CryoFirstPageHeader);
+    size -= MIN(BLCKSZ - sizeof(CryoFirstPageHeader), size);
 
     while (size > 0)
     {
