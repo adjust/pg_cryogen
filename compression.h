@@ -10,6 +10,8 @@ typedef enum
     COMP_ZSTD
 } CompressionMethod;
 
+int compression_method_guc;
+
 char *cryo_compress(CompressionMethod method,
                     const char *data,
                     Size *compressed_size);
@@ -17,5 +19,6 @@ bool cryo_decompress(CompressionMethod method,
                      const char *compressed,
                      Size compressed_size,
                      char *out);
+void cryo_define_compression_gucs(void);
 
 #endif /* __COMPRESSION_H__ */

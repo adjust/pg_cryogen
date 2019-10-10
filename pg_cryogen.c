@@ -89,6 +89,7 @@ void
 _PG_init(void)
 {
     cryo_init_cache();
+    cryo_define_compression_gucs();
 }
 
 static const TupleTableSlotOps *
@@ -518,7 +519,7 @@ cryo_pages_needed(Size size)
 
     Assert(size > 0);
 
-    size -= BLCKSZ - sizeof(CryoFirstPageHeader);
+    size -= MIN(BLCKSZ - sizeof(CryoFirstPageHeader), size);
 
     while (size > 0)
     {
@@ -539,6 +540,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
 {
     GenericXLogState   *xlog_state;
     CryoMetaPage       *metapage;
+    CompressionMethod   method = compression_method_guc;
     Relation    rel = state->relation;
     Size        size;
     char       *compressed, *p;
@@ -547,7 +549,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
     int         i;
     BlockNumber block = state->target_block;
 
-    p = compressed = cryo_compress(COMP_LZ4, state->data, &size);
+    p = compressed = cryo_compress(method, state->data, &size);
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
@@ -583,7 +585,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
             CryoFirstPageHeader *first_hdr = (CryoFirstPageHeader *) hdr;
 
             first_hdr->npages = npages;
-            first_hdr->compression_method = COMP_LZ4; /* TODO */
+            first_hdr->compression_method = method;
             first_hdr->compressed_size = size;
             first_hdr->created_xid = GetCurrentTransactionId();
         }

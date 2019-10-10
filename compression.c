@@ -1,9 +1,36 @@
 #include "storage.h"
 #include "compression.h"
 
+#include "utils/guc.h"
+
 #include "lz4.h"
 #include "zstd.h"
 
+
+static const struct config_enum_entry compression_method_options[] = {
+	{"lz4", COMP_LZ4, false},
+	{"zstd", COMP_ZSTD, false},
+	{NULL, 0, false}
+};
+
+int compression_method_guc = COMP_LZ4;
+
+void
+cryo_define_compression_gucs(void)
+{
+    /* GUCs */
+    DefineCustomEnumVariable("pg_cryogen.compression_method",
+                             "Possible values are lz4 and zstd.",
+                             NULL,
+                             &compression_method_guc,
+                             COMP_ZSTD,
+                             compression_method_options,
+                             PGC_USERSET,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+}
 
 static char *
 lz4_compress(const char *data, Size *compressed_size)
