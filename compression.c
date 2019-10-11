@@ -14,7 +14,7 @@ static const struct config_enum_entry compression_method_options[] = {
 };
 
 int compression_method_guc = COMP_LZ4;
-int lz4_acceleration_guc = 0;
+int lz4_acceleration_guc = 1;
 int zstd_compression_level_guc = 1;
 
 void
@@ -37,8 +37,8 @@ cryo_define_compression_gucs(void)
 							"Sets lz4 acceleration.",
 							NULL,
 							&lz4_acceleration_guc,
-							0,
-							0, 9,
+							1,
+							0, 50,
                             PGC_USERSET,
 							0,
 							NULL,
