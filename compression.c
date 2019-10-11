@@ -14,6 +14,8 @@ static const struct config_enum_entry compression_method_options[] = {
 };
 
 int compression_method_guc = COMP_LZ4;
+int lz4_acceleration_guc = 0;
+int zstd_compression_level_guc = 1;
 
 void
 cryo_define_compression_gucs(void)
@@ -30,6 +32,30 @@ cryo_define_compression_gucs(void)
                              NULL,
                              NULL,
                              NULL);
+
+	DefineCustomIntVariable("pg_cryogen.lz4_acceleration",
+							"Sets lz4 acceleration.",
+							NULL,
+							&lz4_acceleration_guc,
+							0,
+							0, 9,
+                            PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_cryogen.zstd_compression_level",
+							"Sets zstd compression level.",
+							NULL,
+							&zstd_compression_level_guc,
+							1,
+							-5, 22,
+                            PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 }
 
 static char *
@@ -42,7 +68,8 @@ lz4_compress(const char *data, Size *compressed_size)
     compressed = palloc(estimate);
 
     *compressed_size = LZ4_compress_fast(data, compressed,
-                                         CRYO_BLCKSZ, estimate, 0);
+                                         CRYO_BLCKSZ, estimate,
+                                         lz4_acceleration_guc);
     if (*compressed_size == 0)
         elog(ERROR, "pg_cryogen: compression failed");
 
@@ -73,7 +100,8 @@ zstd_compress(const char *data, Size *compressed_size)
     compressed = palloc(estimate);
 
     *compressed_size = ZSTD_compress(compressed, estimate,
-                                     data, CRYO_BLCKSZ, 22);
+                                     data, CRYO_BLCKSZ,
+                                     zstd_compression_level_guc);
     if (*compressed_size == 0)
         elog(ERROR, "pg_cryogen: compression failed");
 

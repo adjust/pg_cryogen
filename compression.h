@@ -11,6 +11,8 @@ typedef enum
 } CompressionMethod;
 
 int compression_method_guc;
+int lz4_acceleration_guc;
+int zstd_compression_level_guc;
 
 char *cryo_compress(CompressionMethod method,
                     const char *data,
