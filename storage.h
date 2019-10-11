@@ -5,19 +5,24 @@
 #include "access/htup.h"
 #include "storage/bufpage.h"
 
+#include "compression.h"
+
+
+#define STORAGE_VERSION     1
+
 /*
  * XXX probably it makes sense to make page size configurable for each table
  * but that would require more complex solution for cache
  */
 #define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
-//#define CRYO_BLCKSZ (1 << 16)   /* 64Kb */
 
 typedef struct
 {
-    PageHeaderData base;    /* to keep PageIsVerified quiet */
-    uint32  target_block;   /* the last block we inserted to;
-                             * zero if we haven't yet */
-    uint64  ntuples;        /* total number of tuples in relation */
+    PageHeaderData  base;           /* to keep PageIsVerified quiet */
+    uint16          version;        /* storage version */
+    uint32          target_block;   /* the last block we inserted to;
+                                     * zero if we haven't yet */
+    uint64          ntuples;        /* total number of tuples in relation */
 } CryoMetaPage;
 
 /*
@@ -26,9 +31,9 @@ typedef struct
  */
 typedef struct
 {
-    PageHeaderData base;    /* we don't use it, but it is required by
-                             * GenericXLogFinish() */
-    uint16  curpage;
+    PageHeaderData  base;           /* we don't use it, but it is required by
+                                     * GenericXLogFinish() */
+    uint16          curpage;
 } CryoPageHeader;
 
 /*
@@ -36,10 +41,11 @@ typedef struct
  */
 typedef struct
 {
-    CryoPageHeader cryo_base;
-    uint16  npages;         /* number of pages for this cryo block */
-    uint32  compressed_size;
-    TransactionId created_xid; /* transaction performed insertion */
+    CryoPageHeader  cryo_base;
+    TransactionId   created_xid;    /* transaction performed insertion */
+    CompressionMethod compression_method;
+    uint32          compressed_size;
+    uint16          npages;         /* number of pages for this cryo block */
 } CryoFirstPageHeader;
 
 #define CryoPageHeaderSize(page) \

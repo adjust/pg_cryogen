@@ -1,8 +1,8 @@
 MODULE_big = pg_cryogen
-OBJS = pg_cryogen.o storage.o cache.o
+OBJS = pg_cryogen.o storage.o cache.o compression.o
 PGFILEDESC = "pg_cryogen - append-only compressed storage"
 
-SHLIB_LINK = -llz4
+SHLIB_LINK = -llz4 -lzstd
 
 EXTENSION = pg_cryogen
 DATA = pg_cryogen--0.1.sql

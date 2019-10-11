@@ -22,9 +22,8 @@
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
-#include "lz4.h"
-
 #include "cache.h"
+#include "compression.h"
 #include "storage.h"
 
 
@@ -90,6 +89,7 @@ void
 _PG_init(void)
 {
     cryo_init_cache();
+    cryo_define_compression_gucs();
 }
 
 static const TupleTableSlotOps *
@@ -97,23 +97,6 @@ cryo_slot_callbacks(Relation relation)
 {
 //    return &TTSOpsBufferHeapTuple;
     return &TTSOpsHeapTuple;
-}
-
-static char *
-cryo_compress(const char *data, Size *compressed_size)
-{
-    Size    estimate;
-    char   *compressed;
-
-    estimate = LZ4_compressBound(CRYO_BLCKSZ);
-    compressed = palloc(estimate);
-
-    *compressed_size = LZ4_compress_fast(data, compressed,
-                                         CRYO_BLCKSZ, estimate, 0);
-    if (*compressed_size == 0)
-        elog(ERROR, "pg_cryogen: compression failed");
-
-    return compressed;
 }
 
 static TableScanDesc
@@ -487,8 +470,9 @@ cryo_load_meta(Relation rel, int lockmode)
          * (see PageIsNew) and won't pass PageIsVerified check
          */
         metapage->base.pd_upper = BLCKSZ;
-        metapage->base.pd_lower = sizeof(CryoPageHeader);
+        metapage->base.pd_lower = sizeof(CryoMetaPage);
         metapage->base.pd_special = BLCKSZ;
+        metapage->version = STORAGE_VERSION;
 
         /* No target block yet */
         metapage->target_block = 0;
@@ -556,6 +540,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
 {
     GenericXLogState   *xlog_state;
     CryoMetaPage       *metapage;
+    CompressionMethod   method = compression_method_guc;
     Relation    rel = state->relation;
     Size        size;
     char       *compressed, *p;
@@ -564,7 +549,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
     int         i;
     BlockNumber block = state->target_block;
 
-    p = compressed = cryo_compress(state->data, &size);
+    p = compressed = cryo_compress(method, state->data, &size);
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
@@ -600,6 +585,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
             CryoFirstPageHeader *first_hdr = (CryoFirstPageHeader *) hdr;
 
             first_hdr->npages = npages;
+            first_hdr->compression_method = method;
             first_hdr->compressed_size = size;
             first_hdr->created_xid = GetCurrentTransactionId();
         }

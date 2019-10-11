@@ -1,6 +1,7 @@
 #include <sys/time.h>
 
 #include "cache.h"
+#include "compression.h"
 #include "storage.h"
 
 #include "access/visibilitymap.h"
@@ -9,8 +10,6 @@
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
-
-#include "lz4.h"
 
 
 /* TODO: make it configurable via GUC variable */
@@ -82,23 +81,6 @@ get_current_timestamp_ms(void)
 }
 
 /*
- * Decompress and store result in `out`
- */
-static bool
-cryo_decompress(const char *compressed, Size compressed_size, char *out)
-{
-    int bytes;
-
-    bytes = LZ4_decompress_safe(compressed, out, compressed_size, CRYO_BLCKSZ);
-    if (bytes < 0)
-        return false;
-
-    Assert(CRYO_BLCKSZ == bytes);
-
-    return true;
-}
-
-/*
  * Read and reassemble compressed data from the buffer manager starting
  * with `block` and decompress it.
  *
@@ -113,9 +95,10 @@ cryo_decompress(const char *compressed, Size compressed_size, char *out)
 static CryoError
 cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
 {
+    CryoPageHeader     *page;
+    CompressionMethod   method;
     Buffer      buf;
     Buffer      vmbuf = InvalidBuffer;
-    CryoPageHeader *page;
     char       *compressed, *p;
     Size        compressed_size, size;
     uint8       vmflags;
@@ -134,6 +117,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
     }
 
     size = compressed_size = ((CryoFirstPageHeader *) page)->compressed_size;
+    method = ((CryoFirstPageHeader *) page)->compression_method;
     p = compressed = palloc(compressed_size);
     entry->nblocks = 1;
 
@@ -171,7 +155,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
         entry->nblocks++;
     }
 
-    if (!cryo_decompress(compressed, compressed_size, entry->data))
+    if (!cryo_decompress(method, compressed, compressed_size, entry->data))
         return CRYO_ERR_DECOMPRESSION_FAILED;
 
     return CRYO_ERR_SUCCESS;
