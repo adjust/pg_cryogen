@@ -502,7 +502,7 @@ cryo_load_meta(Relation rel, int lockmode)
 }
 
 static inline void
-cryo_multi_insert_internal(Relation relation,
+cryo_multi_insert_internal(Relation rel,
                            TupleTableSlot **slots,
                            int ntuples,
                            XactCallback callback)
@@ -517,7 +517,7 @@ cryo_multi_insert_internal(Relation relation,
     {
         Buffer metabuf;
 
-        metabuf = cryo_load_meta(relation, BUFFER_LOCK_SHARE);
+        metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
         metapage = (CryoMetaPage *) BufferGetPage(metabuf);
         modifyState.target_block = metapage->target_block;
         UnlockReleaseBuffer(metabuf);
@@ -541,12 +541,21 @@ cryo_multi_insert_internal(Relation relation,
             cryo_init_page(hdr);
 #else
             /* Read the target block contents into modifyState.data */
-            cryo_read_data(relation, modifyState.target_block,  modifyState.data);
+            cryo_read_data(rel, modifyState.target_block,  modifyState.data);
 #endif
         }
-        modifyState.relation = relation;
+        modifyState.relation = rel;
         modifyState.tuples_inserted = 0;
     }
+    else if (RelationGetRelid(modifyState.relation) != RelationGetRelid(rel))
+    {
+        /*
+         * TODO: probably it's better just flush whatever changes we currently
+         * have in the modifyState and reinitialize it for a new relation.
+         */
+        elog(ERROR, "pg_cryogen: modifications to only a single table per transaction are possible");
+    }
+
 
     for (i = 0; i < ntuples; ++i)
     {
@@ -575,7 +584,7 @@ cryo_multi_insert_internal(Relation relation,
         }
         modifyState.tuples_inserted++;
 
-        slots[i]->tts_tableOid = RelationGetRelid(relation);
+        slots[i]->tts_tableOid = RelationGetRelid(rel);
         /* position in item pointer starts with 1 */
         ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
     }

@@ -13,7 +13,7 @@ static const struct config_enum_entry compression_method_options[] = {
 	{NULL, 0, false}
 };
 
-int compression_method_guc = COMP_LZ4;
+int compression_method_guc = COMP_ZSTD;
 int lz4_acceleration_guc = 1;
 int zstd_compression_level_guc = 1;
 
