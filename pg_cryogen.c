@@ -70,26 +70,40 @@ typedef struct CryoModifyState
     Relation    relation;
     BlockNumber target_block;
     uint32      tuples_inserted;
-    Buffer      metabuf;
     char        data[CRYO_BLCKSZ];  /* decompressed data */
 } CryoModifyState;
 
 CryoModifyState modifyState = {
-    .metabuf = InvalidBuffer,
-    .tuples_inserted = 0
+    .tuples_inserted = 0,
+    .relation = NULL
 };
 
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
-
+static void cryo_preserve(CryoModifyState *state, bool advance);
 void _PG_init(void);
+
+static void
+cryo_xact_callback(XactEvent event, void *arg)
+{
+    if (event == XACT_EVENT_PRE_COMMIT)
+    {
+        if (modifyState.tuples_inserted)
+        {
+            cryo_preserve(&modifyState, true);
+        }
+        modifyState.tuples_inserted = 0;
+        modifyState.relation = NULL;
+    }
+}
 
 void
 _PG_init(void)
 {
     cryo_init_cache();
     cryo_define_compression_gucs();
+    RegisterXactCallback(cryo_xact_callback, NULL);
 }
 
 static const TupleTableSlotOps *
@@ -487,11 +501,93 @@ cryo_load_meta(Relation rel, int lockmode)
     return metabuf;
 }
 
+static inline void
+cryo_multi_insert_internal(Relation relation,
+                           TupleTableSlot **slots,
+                           int ntuples,
+                           XactCallback callback)
+{
+    CryoDataHeader *hdr;
+    CryoMetaPage   *metapage;
+    int             i;
+
+    hdr = (CryoDataHeader *) modifyState.data;
+
+    if (!RelationIsValid(modifyState.relation))
+    {
+        Buffer metabuf;
+
+        metabuf = cryo_load_meta(relation, BUFFER_LOCK_SHARE);
+        metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+        modifyState.target_block = metapage->target_block;
+        UnlockReleaseBuffer(metabuf);
+
+        /* initialize modify state */
+        if (modifyState.target_block == 0)
+        {
+            /* This is a first data block in the relation */
+            cryo_init_page(hdr);
+            modifyState.target_block = 1;
+        }
+        else
+        {
+#ifdef ONE_WRITE_ONE_BLOCK
+            /*
+             * In order to ensure that storage is  consistent we create entirely
+             * new block for every multi_insert instead of adding tuples to an
+             * existing one. This also makes visibility check much simpler and
+             * faster: we just check transaction id in a block header.
+             */
+            cryo_init_page(hdr);
+#else
+            /* Read the target block contents into modifyState.data */
+            cryo_read_data(relation, modifyState.target_block,  modifyState.data);
+#endif
+        }
+        modifyState.relation = relation;
+        modifyState.tuples_inserted = 0;
+    }
+
+    for (i = 0; i < ntuples; ++i)
+    {
+        HeapTuple   tuple;
+        int         pos;
+
+        CHECK_FOR_INTERRUPTS();
+
+        tuple = ExecCopySlotHeapTuple(slots[i]);
+        if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
+        {
+            /*
+             * Compress and flush current block to the disk (if needed),
+             * create a new one and retry insertion
+             */
+            if (modifyState.tuples_inserted != 0)
+            {
+                cryo_preserve(&modifyState, true);
+                modifyState.tuples_inserted = 0;
+            }
+            cryo_init_page(hdr);
+            if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
+            {
+                elog(ERROR, "tuple is too large to fit the cryo block");
+            }
+        }
+        modifyState.tuples_inserted++;
+
+        slots[i]->tts_tableOid = RelationGetRelid(relation);
+        /* position in item pointer starts with 1 */
+        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
+    }
+}
+
+bool flag = false;
+
 static void
 cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
                   int options, BulkInsertState bistate)
 {
-    NOT_IMPLEMENTED;
+    (void) cryo_multi_insert_internal(relation, &slot, 1, cryo_xact_callback);
 }
 
 static void
@@ -545,11 +641,16 @@ cryo_preserve(CryoModifyState *state, bool advance)
     Size        size;
     char       *compressed, *p;
     int         npages;
+    Buffer      metabuf;
     Buffer     *buffers;
     int         i;
-    BlockNumber block = state->target_block;
+    BlockNumber block;
 
     p = compressed = cryo_compress(method, state->data, &size);
+
+    metabuf = cryo_load_meta(state->relation, BUFFER_LOCK_EXCLUSIVE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+    block = metapage->target_block;
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
@@ -614,7 +715,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
     /* update metadata */
     xlog_state = GenericXLogStart(state->relation);
     metapage = (CryoMetaPage *)
-        GenericXLogRegisterBuffer(xlog_state, state->metabuf,
+        GenericXLogRegisterBuffer(xlog_state, metabuf,
                                   GENERIC_XLOG_FULL_IMAGE);
 #ifdef ONE_WRITE_ONE_BLOCK
     if (advance)
@@ -622,12 +723,13 @@ cryo_preserve(CryoModifyState *state, bool advance)
 #endif
     metapage->target_block = state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
-    MarkBufferDirty(state->metabuf);
+    MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
 
     /* Release all affected buffers */
     for (i = 0; i < npages; ++i)
         UnlockReleaseBuffer(buffers[i]);
+    UnlockReleaseBuffer(metabuf);
 
 #ifndef ONE_WRITE_ONE_BLOCK
     if (advance)
@@ -639,80 +741,7 @@ static void
 cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                   CommandId cid, int options, BulkInsertState bistate)
 {
-    CryoDataHeader *hdr;
-    CryoMetaPage   *metapage;
-    int             i;
-
-    hdr = (CryoDataHeader *) modifyState.data;
-
-    if (!BufferIsValid(modifyState.metabuf))
-    {
-        /* 
-         * TODO: probably we don't want to lock buffer exclusevely until we
-         * actually about to start writing to disk. Share lock seems to be
-         * enough here
-         */
-        modifyState.metabuf = cryo_load_meta(relation, BUFFER_LOCK_EXCLUSIVE);
-        metapage = (CryoMetaPage *) BufferGetPage(modifyState.metabuf);
-        modifyState.target_block = metapage->target_block;
-
-        /* initialize modify state */
-        if (modifyState.target_block == 0)
-        {
-            /* This is a first data block in the relation */
-            cryo_init_page(hdr);
-            modifyState.target_block = 1;
-        }
-        else
-        {
-#ifdef ONE_WRITE_ONE_BLOCK
-            /* 
-             * In order to ensure that storage is  consistent we create entirely
-             * new block for every multi_insert instead of adding tuples to an
-             * existing one. This also makes visibility check much simpler and
-             * faster: we just check transaction id in a block header.
-             */
-            cryo_init_page(hdr);
-#else
-            /* Read the target block contents into modifyState.data */
-            cryo_read_data(relation, modifyState.target_block,  modifyState.data);
-#endif
-        }
-        modifyState.relation = relation;
-        modifyState.tuples_inserted = 0;
-    }
-
-    for (i = 0; i < ntuples; ++i)
-    {
-        HeapTuple   tuple;
-        int         pos;
-
-        CHECK_FOR_INTERRUPTS();
-
-        tuple = ExecCopySlotHeapTuple(slots[i]);
-        if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
-        {
-            /* 
-             * Compress and flush current block to the disk (if needed),
-             * create a new one and retry insertion
-             */
-            if (modifyState.tuples_inserted != 0)
-            {
-                cryo_preserve(&modifyState, true);
-                modifyState.tuples_inserted = 0;
-            }
-            cryo_init_page(hdr);
-            if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
-            {
-                elog(ERROR, "tuple is too large to fit the cryo block");
-            }
-        }
-        modifyState.tuples_inserted++;
-
-        slots[i]->tts_tableOid = RelationGetRelid(relation);
-        /* position in item pointer starts with 1 */
-        ItemPointerSet(&slots[i]->tts_tid, modifyState.target_block, pos);
-    }
+    (void) cryo_multi_insert_internal(relation, slots, ntuples, NULL);
 }
 
 static void
@@ -735,9 +764,8 @@ cryo_finish_bulk_insert(Relation rel, int options)
 #endif
     }
 
-    UnlockReleaseBuffer(modifyState.metabuf);
     modifyState.tuples_inserted = 0;
-    modifyState.metabuf = InvalidBuffer;
+    modifyState.relation = NULL;
 }
 
 static TM_Result
