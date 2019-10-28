@@ -17,6 +17,7 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/relcache.h"
@@ -89,9 +90,21 @@ flush_modify_state(void)
 {
     if (modifyState.tuples_inserted)
     {
+#ifdef ONE_WRITE_ONE_BLOCK
+        /*
+         * Advance target_block so that next tuple will be written into a new
+         * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
+         * details.
+         */
         cryo_preserve(&modifyState, true);
+#else
+        cryo_preserve(&modifyState, false);
+#endif
     }
     modifyState.tuples_inserted = 0;
+
+    if (modifyState.relation)
+        UnlockRelation(modifyState.relation, ShareRowExclusiveLock);
     modifyState.relation = NULL;
 }
 
@@ -101,6 +114,16 @@ init_modify_state(Relation rel)
     Buffer          metabuf;
     CryoMetaPage   *metapage;
     CryoDataHeader *hdr = (CryoDataHeader *) modifyState.data;
+
+    /*
+     * Do not allow concurrent inserts otherwise we can get inconsistent
+     * records in indexes. We store block number into ItemPointers
+     * during insert_tuple() but actual write to disk occures later (by the
+     * end of transaction in some cases). We do not want another process
+     * writing to the same block before us. We should probably come up with
+     * a non-blocking solution.
+     */
+    LockRelation(rel, ShareRowExclusiveLock);
 
     metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
     metapage = (CryoMetaPage *) BufferGetPage(metabuf);
@@ -772,22 +795,7 @@ cryo_finish_bulk_insert(Relation rel, int options)
     if (!RelationIsValid(rel))
         return;
 
-    if (modifyState.tuples_inserted)
-    {
-#ifdef ONE_WRITE_ONE_BLOCK
-        /*
-         * Advance target_block so that next tuple will be written into a new
-         * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
-         * details.
-         */
-        cryo_preserve(&modifyState, true);
-#else
-        cryo_preserve(&modifyState, false);
-#endif
-    }
-
-    modifyState.tuples_inserted = 0;
-    modifyState.relation = NULL;
+    flush_modify_state();
 }
 
 static TM_Result
