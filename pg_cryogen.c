@@ -85,16 +85,61 @@ static void cryo_preserve(CryoModifyState *state, bool advance);
 void _PG_init(void);
 
 static void
+flush_modify_state(void)
+{
+    if (modifyState.tuples_inserted)
+    {
+        cryo_preserve(&modifyState, true);
+    }
+    modifyState.tuples_inserted = 0;
+    modifyState.relation = NULL;
+}
+
+static void
+init_modify_state(Relation rel)
+{
+    Buffer          metabuf;
+    CryoMetaPage   *metapage;
+    CryoDataHeader *hdr = (CryoDataHeader *) modifyState.data;
+
+    metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
+    modifyState.target_block = metapage->target_block;
+    UnlockReleaseBuffer(metabuf);
+
+    /* initialize modify state */
+    if (modifyState.target_block == 0)
+    {
+        /* This is a first data block in the relation */
+
+        cryo_init_page(hdr);
+        modifyState.target_block = 1;
+    }
+    else
+    {
+#ifdef ONE_WRITE_ONE_BLOCK
+        /*
+         * In order to ensure that storage is  consistent we create entirely
+         * new block for every multi_insert instead of adding tuples to an
+         * existing one. This also makes visibility check much simpler and
+         * faster: we just check transaction id in a block header.
+         */
+        cryo_init_page(hdr);
+#else
+        /* Read the target block contents into modifyState.data */
+        cryo_read_data(rel, modifyState.target_block,  modifyState.data);
+#endif
+    }
+    modifyState.relation = rel;
+    modifyState.tuples_inserted = 0;
+}
+
+static void
 cryo_xact_callback(XactEvent event, void *arg)
 {
     if (event == XACT_EVENT_PRE_COMMIT)
     {
-        if (modifyState.tuples_inserted)
-        {
-            cryo_preserve(&modifyState, true);
-        }
-        modifyState.tuples_inserted = 0;
-        modifyState.relation = NULL;
+        (void) flush_modify_state();
     }
 }
 
@@ -507,55 +552,23 @@ cryo_multi_insert_internal(Relation rel,
                            int ntuples,
                            XactCallback callback)
 {
-    CryoDataHeader *hdr;
-    CryoMetaPage   *metapage;
+    CryoDataHeader *hdr = (CryoDataHeader *) modifyState.data;
     int             i;
 
-    hdr = (CryoDataHeader *) modifyState.data;
 
     if (!RelationIsValid(modifyState.relation))
     {
-        Buffer metabuf;
-
-        metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
-        metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-        modifyState.target_block = metapage->target_block;
-        UnlockReleaseBuffer(metabuf);
-
-        /* initialize modify state */
-        if (modifyState.target_block == 0)
-        {
-            /* This is a first data block in the relation */
-            cryo_init_page(hdr);
-            modifyState.target_block = 1;
-        }
-        else
-        {
-#ifdef ONE_WRITE_ONE_BLOCK
-            /*
-             * In order to ensure that storage is  consistent we create entirely
-             * new block for every multi_insert instead of adding tuples to an
-             * existing one. This also makes visibility check much simpler and
-             * faster: we just check transaction id in a block header.
-             */
-            cryo_init_page(hdr);
-#else
-            /* Read the target block contents into modifyState.data */
-            cryo_read_data(rel, modifyState.target_block,  modifyState.data);
-#endif
-        }
-        modifyState.relation = rel;
-        modifyState.tuples_inserted = 0;
+        init_modify_state(rel);
     }
     else if (RelationGetRelid(modifyState.relation) != RelationGetRelid(rel))
     {
         /*
-         * TODO: probably it's better just flush whatever changes we currently
-         * have in the modifyState and reinitialize it for a new relation.
+         * Flush whatever changes we currently have in the modifyState and
+         * reinitialize it for a new relation.
          */
-        elog(ERROR, "pg_cryogen: modifications to only a single table per transaction are possible");
+        flush_modify_state();
+        init_modify_state(rel);
     }
-
 
     for (i = 0; i < ntuples; ++i)
     {
