@@ -36,6 +36,7 @@ typedef unsigned long long TS;
 typedef struct
 {
     PageId      key;
+    bool        pinned;     /* cache entry cannot be evicted when true */
     TS          ts;         /* timestamp for LRU */
     uint32      nblocks;    /* number of postgres blocks */
     TransactionId xid;      /* transaction created block */
@@ -161,6 +162,57 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
     return CRYO_ERR_SUCCESS;
 }
 
+static PageIdCacheEntry *
+allocate_cache_slot(PageId *pageId)
+{
+    int         i;
+    CacheEntry  new_entry = InvalidCacheEntry;
+    TS          min_ts = -1; /* max unsigned long long */
+    int         min_ts_pos = InvalidCacheEntry;
+    PageIdCacheEntry *item;
+
+    /* find an available spot in the cache or evict old cache entry */
+    for (i = 0; i < CACHE_SIZE; ++i)
+    {
+        if (cache[i].pinned)
+            continue;
+
+        if (cache[i].ts == 0)
+        {
+            new_entry = i;
+            break;
+        }
+
+        if (cache[i].ts < min_ts)
+            min_ts_pos = i;
+    }
+
+    if (new_entry == InvalidCacheEntry)
+    {
+        if (min_ts_pos == InvalidCacheEntry)
+            return NULL;
+        /*
+         * We didn't manage to find uninitialized cache entries. But we
+         * found least recently used one. We also need to remove the old
+         * record from pagemap.
+         */
+        elog(DEBUG1,
+             "pg_cryogen: evicted cache entry for (%i, %i)",
+             cache[min_ts_pos].key.relid,
+             cache[min_ts_pos].key.blockno);
+        hash_search(pagemap, &cache[min_ts_pos].key, HASH_REMOVE, NULL);
+        new_entry = min_ts_pos;
+    }
+
+    /* cache entry is not found, load data from disk */
+    item = hash_search(pagemap, pageId, HASH_ENTER, NULL);
+    item->key.relid = pageId->relid;
+    item->key.blockno = pageId->blockno;
+    item->entry = new_entry;
+
+    return item;
+}
+
 CryoError
 cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
 {
@@ -183,50 +235,19 @@ cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
 
     if (!found || item->entry == InvalidCacheEntry)
     {
-        int i;
-        CacheEntry  new_entry = InvalidCacheEntry;
         CryoError   err;
-        TS          min_ts = -1; /* max unsigned long long */
-        int         min_ts_pos;
 
-        /* find available spot in cache or evict old cache entry */
-        for (i = 0; i < CACHE_SIZE; ++i)
-        {
-            if (cache[i].ts == 0)
-            {
-                new_entry = i;
-                break;
-            }
+        /* find an available slot in the cache */
+        item = allocate_cache_slot(&pageId);
 
-            if (cache[i].ts < min_ts)
-                min_ts_pos = i;
-        }
-
-        if (new_entry == InvalidCacheEntry)
-        {
-            /*
-             * We didn't manage to find uninitialized cache entries. But we
-             * found least recently used one. We also need to remove the old
-             * record from pagemap.
-             */
-            elog(DEBUG1,
-                 "pg_cryogen: evicted cache entry for (%i, %i)",
-                 cache[min_ts_pos].key.relid,
-                 cache[min_ts_pos].key.blockno);
-            hash_search(pagemap, &cache[min_ts_pos].key, HASH_REMOVE, NULL);
-            new_entry = min_ts_pos;
-        }
-
-        /* cache entry is not found, load data from disk */
-        item = hash_search(pagemap, &pageId, HASH_ENTER, NULL);
-        item->key.relid = RelationGetRelid(rel);
-        item->key.blockno = blockno;
-        item->entry = new_entry;
+        if (!item)
+            return CRYO_ERR_CACHE_IS_FULL;
 
         /* load cryo block */
         cache[item->entry].ts = get_current_timestamp_ms();
         cache[item->entry].key = item->key;
-        err = cryo_read_decompress(rel, blockno, &cache[new_entry]);
+        cache[item->entry].pinned = false;
+        err = cryo_read_decompress(rel, blockno, &cache[item->entry]);
         if (err != CRYO_ERR_SUCCESS)
         {
             *result = item->entry = InvalidCacheEntry;
@@ -236,6 +257,51 @@ cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
 
     *result = item->entry;
     return CRYO_ERR_SUCCESS;
+}
+
+CacheEntry
+cryo_cache_allocate(Relation rel, BlockNumber blockno)
+{
+    bool    found;
+    PageId  pageId = {
+        .relid = RelationGetRelid(rel),
+        .blockno = blockno
+    };
+    PageIdCacheEntry *item;
+
+    /* check with hashtable */
+    item = hash_search(pagemap, &pageId, HASH_FIND, &found);
+
+    if (!found || item->entry == InvalidCacheEntry)
+    {
+        /* find an available slot in the cache */
+        item = allocate_cache_slot(&pageId);
+
+        if (!item)
+            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(CRYO_ERR_CACHE_IS_FULL));
+    }
+    cache[item->entry].ts = get_current_timestamp_ms();
+    cache[item->entry].key = item->key;
+    cache[item->entry].pinned = true;
+
+    return item->entry;
+}
+
+void
+cryo_cache_release(CacheEntry entry)
+{
+    PageIdCacheEntry   *item;
+    bool                found;
+    CacheEntryHeader   *slot = &cache[entry];
+
+    if (!slot->pinned)
+        elog(ERROR, "pg_cryogen: trying to release read-only cache entry");
+
+    item = hash_search(pagemap, &slot->key, HASH_REMOVE, &found);
+    if (!found || item->entry == InvalidCacheEntry)
+        elog(ERROR, "pg_cryogen: invalid cache entry");
+
+    slot->ts = 0;
 }
 
 uint32
@@ -274,6 +340,8 @@ cryo_cache_err(CryoError err)
             return "wrong starting block number";
         case CRYO_ERR_DECOMPRESSION_FAILED:
             return "decompression failed";
+        case CRYO_ERR_CACHE_IS_FULL:
+            return "cannot allocate cache slot; all slots are locked for modification";
         default:
             return "unknown error";
     }

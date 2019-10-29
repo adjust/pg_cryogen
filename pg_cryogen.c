@@ -71,7 +71,8 @@ typedef struct CryoModifyState
     Relation    relation;
     BlockNumber target_block;
     uint32      tuples_inserted;
-    char        data[CRYO_BLCKSZ];  /* decompressed data */
+    CacheEntry  cacheEntry; /* cached decompressed page reference */
+    char       *data;               /* decompressed data */
 } CryoModifyState;
 
 CryoModifyState modifyState = {
@@ -88,6 +89,9 @@ void _PG_init(void);
 static void
 flush_modify_state(void)
 {
+    if (!RelationIsValid(modifyState.relation))
+        return;
+
     if (modifyState.tuples_inserted)
     {
 #ifdef ONE_WRITE_ONE_BLOCK
@@ -103,6 +107,8 @@ flush_modify_state(void)
     }
     modifyState.tuples_inserted = 0;
 
+    cryo_cache_release(modifyState.cacheEntry);
+
     if (modifyState.relation)
         UnlockRelation(modifyState.relation, ShareRowExclusiveLock);
     modifyState.relation = NULL;
@@ -113,7 +119,7 @@ init_modify_state(Relation rel)
 {
     Buffer          metabuf;
     CryoMetaPage   *metapage;
-    CryoDataHeader *hdr = (CryoDataHeader *) modifyState.data;
+    CryoDataHeader *hdr;
 
     /*
      * Do not allow concurrent inserts otherwise we can get inconsistent
@@ -129,6 +135,10 @@ init_modify_state(Relation rel)
     metapage = (CryoMetaPage *) BufferGetPage(metabuf);
     modifyState.target_block = metapage->target_block;
     UnlockReleaseBuffer(metabuf);
+
+    modifyState.cacheEntry = cryo_cache_allocate(rel, modifyState.target_block);
+    modifyState.data = cryo_cache_get_data(modifyState.cacheEntry);
+    hdr = (CryoDataHeader *) modifyState.data;
 
     /* initialize modify state */
     if (modifyState.target_block == 0)
@@ -575,7 +585,7 @@ cryo_multi_insert_internal(Relation rel,
                            int ntuples,
                            XactCallback callback)
 {
-    CryoDataHeader *hdr = (CryoDataHeader *) modifyState.data;
+    CryoDataHeader *hdr;
     int             i;
 
 
@@ -592,6 +602,7 @@ cryo_multi_insert_internal(Relation rel,
         flush_modify_state();
         init_modify_state(rel);
     }
+    hdr = (CryoDataHeader *) modifyState.data;
 
     for (i = 0; i < ntuples; ++i)
     {
@@ -609,6 +620,7 @@ cryo_multi_insert_internal(Relation rel,
              */
             if (modifyState.tuples_inserted != 0)
             {
+                /* TODO: use flush and init here */
                 cryo_preserve(&modifyState, true);
                 modifyState.tuples_inserted = 0;
             }
