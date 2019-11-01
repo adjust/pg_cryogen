@@ -33,7 +33,9 @@ typedef struct
 {
     PageHeaderData  base;           /* we don't use it, but it is required by
                                      * GenericXLogFinish() */
-    uint16          curpage;
+    //uint16          curpage;
+    BlockNumber     first;
+    BlockNumber     next;
 } CryoPageHeader;
 
 /*
@@ -48,8 +50,8 @@ typedef struct
     uint16          npages;         /* number of pages for this cryo block */
 } CryoFirstPageHeader;
 
-#define CryoPageHeaderSize(page) \
-    ((page)->curpage == 0 ? sizeof(CryoFirstPageHeader) : sizeof(CryoPageHeader))
+#define CryoPageHeaderSize(page, block) \
+    ((page)->first == block ? sizeof(CryoFirstPageHeader) : sizeof(CryoPageHeader))
 
 /* */
 typedef struct

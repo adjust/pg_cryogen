@@ -25,6 +25,7 @@
 
 #include "cache.h"
 #include "compression.h"
+#include "scan_iterator.h"
 #include "storage.h"
 
 
@@ -56,6 +57,7 @@ typedef struct CryoScanDescData
     BlockNumber         cur_block;
     uint32              cur_item;
     BlockNumber         target_block;
+    SeqScanIterator    *iterator;
     CacheEntry          cacheEntry; /* cached decompressed page reference */
 } CryoScanDescData;
 typedef CryoScanDescData *CryoScanDesc;
@@ -84,6 +86,7 @@ CryoModifyState modifyState = {
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
 static void cryo_preserve(CryoModifyState *state, bool advance);
+static BlockNumber cryo_reserve_blockno(Relation rel);
 void _PG_init(void);
 
 static void
@@ -109,33 +112,29 @@ flush_modify_state(void)
 
     cryo_cache_release(modifyState.cacheEntry);
 
-    if (modifyState.relation)
-        UnlockRelation(modifyState.relation, ShareRowExclusiveLock);
     modifyState.relation = NULL;
 }
 
 static void
 init_modify_state(Relation rel)
 {
-    Buffer          metabuf;
-    CryoMetaPage   *metapage;
     CryoDataHeader *hdr;
 
+    /* init meta page */
+    if (RelationGetNumberOfBlocks(rel) == 0)
+    {
+        Buffer          metabuf;
+
+        metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
+        UnlockReleaseBuffer(metabuf);
+    }
+
     /*
-     * Do not allow concurrent inserts otherwise we can get inconsistent
-     * records in indexes. We store block number into ItemPointers
-     * during insert_tuple() but actual write to disk occures later (by the
-     * end of transaction in some cases). We do not want another process
-     * writing to the same block before us. We should probably come up with
-     * a non-blocking solution.
+     * We need to allocate a single block which number will serve as an
+     * identification for ItemPointers. Read comment in scan_iterator.c for
+     * details.
      */
-    LockRelation(rel, ShareRowExclusiveLock);
-
-    metabuf = cryo_load_meta(rel, BUFFER_LOCK_SHARE);
-    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-    modifyState.target_block = metapage->target_block;
-    UnlockReleaseBuffer(metabuf);
-
+    modifyState.target_block = cryo_reserve_blockno(rel);
     modifyState.cacheEntry = cryo_cache_allocate(rel, modifyState.target_block);
     modifyState.data = cryo_cache_get_data(modifyState.cacheEntry);
     hdr = (CryoDataHeader *) modifyState.data;
@@ -160,7 +159,7 @@ init_modify_state(Relation rel)
         cryo_init_page(hdr);
 #else
         /* Read the target block contents into modifyState.data */
-        cryo_read_data(rel, modifyState.target_block,  modifyState.data);
+        cryo_read_data(rel, NULL, modifyState.target_block,  modifyState.data);
 #endif
     }
     modifyState.relation = rel;
@@ -170,9 +169,20 @@ init_modify_state(Relation rel)
 static void
 cryo_xact_callback(XactEvent event, void *arg)
 {
-    if (event == XACT_EVENT_PRE_COMMIT)
+    switch (event)
     {
-        (void) flush_modify_state();
+        case XACT_EVENT_PRE_COMMIT:
+            (void) flush_modify_state();
+            break;
+
+        case XACT_EVENT_ABORT:
+            modifyState.relation = NULL;
+            modifyState.tuples_inserted = 0;
+            break;
+
+        default:
+            /* do nothing */
+            ;
     }
 }
 
@@ -215,7 +225,8 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->cur_item = 0;
     scan->cur_block = 0;
     scan->nblocks = 0;
-    scan->cacheEntry = InvalidCacheEntry;
+    scan->cacheEntry = InvalidCacheEntry; 
+    scan->iterator = cryo_seqscan_iter_create();
 
     metabuf = cryo_load_meta(relation, BUFFER_LOCK_SHARE);
     metapage = (CryoMetaPage *) BufferGetPage(metabuf);
@@ -268,19 +279,17 @@ cryo_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *s
 read_block:
     if (scan->cur_item == 0)
     {
-        scan->cur_block = MAX(1, scan->cur_block);  /* initial case */
+        scan->cur_block = cryo_seqscan_iter_next(scan->iterator);
 
         /*
-         * Either it's a first block to scan or there are no more tuples in the
-         * current block. Proceed to the next one,
+         * TODO: probably read the number of block just once and store in the
+         * scan state
          */
-        scan->cur_block += scan->nblocks;
-
-        /* Reach the end of relation? */
-        if (scan->target_block <= scan->cur_block)
+        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
             return false;
 
-        err = cryo_read_data(rel, scan->cur_block, &scan->cacheEntry);
+        err = cryo_read_data(rel, scan->iterator, scan->cur_block,
+                             &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
         scan->nblocks = cryo_cache_get_pg_nblocks(scan->cacheEntry);
@@ -394,6 +403,7 @@ cryo_index_fetch_tuple(struct IndexFetchTableData *scan,
     CryoError           err;
 
     err = cryo_read_data(cscan->base.rel,
+                         NULL, /* TODO */
                          ItemPointerGetBlockNumber(tid),
                          &cscan->cacheEntry);
 
@@ -431,7 +441,8 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
 
     blockno = tbmres->blockno;
 
-    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->cacheEntry);
+    err = cryo_read_data(cscan->rs_base.rs_rd, cscan->iterator, blockno,
+                         &cscan->cacheEntry);
     switch (err)
     {
         case CRYO_ERR_SUCCESS:
@@ -579,6 +590,19 @@ cryo_load_meta(Relation rel, int lockmode)
     return metabuf;
 }
 
+static BlockNumber
+cryo_reserve_blockno(Relation rel)
+{
+    Buffer      buf;
+    BlockNumber res;
+
+    buf = ReadBuffer(rel, P_NEW);
+    res = BufferGetBlockNumber(buf);
+    ReleaseBuffer(buf);
+
+    return res;
+}
+
 static inline void
 cryo_multi_insert_internal(Relation rel,
                            TupleTableSlot **slots,
@@ -618,13 +642,10 @@ cryo_multi_insert_internal(Relation rel,
              * Compress and flush current block to the disk (if needed),
              * create a new one and retry insertion
              */
-            if (modifyState.tuples_inserted != 0)
-            {
-                /* TODO: use flush and init here */
-                cryo_preserve(&modifyState, true);
-                modifyState.tuples_inserted = 0;
-            }
-            cryo_init_page(hdr);
+            flush_modify_state();
+            init_modify_state(rel);
+            hdr = (CryoDataHeader *) modifyState.data;
+
             if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
             {
                 elog(ERROR, "tuple is too large to fit the cryo block");
@@ -707,7 +728,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
 
     metabuf = cryo_load_meta(state->relation, BUFFER_LOCK_EXCLUSIVE);
     metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-    block = metapage->target_block;
+    block = state->target_block;
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
@@ -717,12 +738,12 @@ cryo_preserve(CryoModifyState *state, bool advance)
 
     for (i = 0; i < npages; ++i)
     {
-        /* read buffer or create new blocks if they are not there */
-        if (RelationGetNumberOfBlocks(rel) > block + i)
-            buffers[i] = ReadBuffer(rel, block + i);
-        else
-            buffers[i] = ReadBuffer(rel, P_NEW);
+        /* the first block was preallocated in init_modify_state */
+        buffers[i] = ReadBuffer(rel, block);
         LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
+
+        /* but the rest of the blocks must be allocated here */
+        block = P_NEW;
     }
 
     for (i = 0; i < npages; ++i)
@@ -735,7 +756,8 @@ cryo_preserve(CryoModifyState *state, bool advance)
         hdr = (CryoPageHeader *)
             GenericXLogRegisterBuffer(xlog_state, buffers[i],
                                       GENERIC_XLOG_FULL_IMAGE);
-        hdr->curpage = i;
+        hdr->first = BufferGetBlockNumber(buffers[0]);
+        hdr->next = (i + 1 < npages) ? BufferGetBlockNumber(buffers[i + 1]) : InvalidBlockNumber;
 
         /* write additional info into the first page */
         if (i == 0)
@@ -747,7 +769,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
             first_hdr->compressed_size = size;
             first_hdr->created_xid = GetCurrentTransactionId();
         }
-        hdr_size = CryoPageHeaderSize(hdr);
+        hdr_size = CryoPageHeaderSize(hdr, BufferGetBlockNumber(buffers[i]));
         content_size = BLCKSZ - hdr_size;
 
         hdr->base.pd_checksum = 0; /* TODO */
@@ -838,7 +860,8 @@ cryo_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
     CacheEntry      cacheEntry;
     HeapTuple       tuple;
 
-    err = cryo_read_data(relation, ItemPointerGetBlockNumber(tid), &cacheEntry);
+    err = cryo_read_data(relation, NULL, ItemPointerGetBlockNumber(tid),
+                         &cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
         elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
@@ -955,6 +978,7 @@ static bool
 cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
                              BufferAccessStrategy bstrategy)
 {
+#if 0
     CryoPageHeader *page;
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     Buffer          buf;
@@ -991,7 +1015,7 @@ cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 
     cscan->cur_block = blockno;
     cscan->cur_item = 1;
-
+#endif
     return true;
 }
 
@@ -1268,6 +1292,7 @@ static void
 cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                 BufferAccessStrategy bstrategy)
 {
+#if 0
     int         npages = RelationGetNumberOfBlocks(onerel);
     BlockNumber blkno;
     TransactionId   oldest_xmin, freeze_limit, xid_full_scan_limit;
@@ -1323,6 +1348,7 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
 
         blkno += page->npages;
     }
+#endif
 }
 
 /*

@@ -40,6 +40,8 @@ typedef struct
     TS          ts;         /* timestamp for LRU */
     uint32      nblocks;    /* number of postgres blocks */
     TransactionId xid;      /* transaction created block */
+    BlockNumber blocks[CRYO_BLCKSZ / BLCKSZ];   /* cache block numbers *
+                                                 * for SeqScanIterator */
     char        data[CRYO_BLCKSZ];
 } CacheEntryHeader;
 
@@ -94,7 +96,8 @@ get_current_timestamp_ms(void)
  * XXX Move visibility check here to avoid unnecessary i/o.
  */
 static CryoError
-cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
+cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
+                     CacheEntryHeader *entry)
 {
     CryoPageHeader     *page;
     CompressionMethod   method;
@@ -111,7 +114,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
      * In case of brin index bitmap scan can try to read data not from the
      * first page.
      */
-    if (page->curpage != 0)
+    if (page->first != block)
     {
         ReleaseBuffer(buf);
         return CRYO_ERR_WRONG_STARTING_BLOCK;
@@ -120,7 +123,7 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
     size = compressed_size = ((CryoFirstPageHeader *) page)->compressed_size;
     method = ((CryoFirstPageHeader *) page)->compression_method;
     p = compressed = palloc(compressed_size);
-    entry->nblocks = 1;
+    entry->blocks[entry->nblocks++] = block;
 
     /*
      * Check whether page is frozen.
@@ -138,9 +141,9 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
 
     while (true)
     {
-        Size    content_size = BLCKSZ - CryoPageHeaderSize(page);
+        Size    content_size = BLCKSZ - CryoPageHeaderSize(page, block);
         Size    l = MIN(content_size, size);
-        char   *page_content = ((char *) page) + CryoPageHeaderSize(page);
+        char   *page_content = ((char *) page) + CryoPageHeaderSize(page, block);
 
         memcpy(p, page_content, l);
         p += l;
@@ -151,9 +154,13 @@ cryo_read_decompress(Relation rel, BlockNumber block, CacheEntryHeader *entry)
             break;
 
         /* read the next block */
-        buf = ReadBuffer(rel, ++block);
+        if (!BlockNumberIsValid(page->next))
+            break;
+        block = page->next;
+        buf = ReadBuffer(rel, block);
         page = (CryoPageHeader *) BufferGetPage(buf);
-        entry->nblocks++;
+        cryo_seqscan_iter_exclude(iter, block, false);
+        entry->blocks[entry->nblocks++] = block;
     }
 
     if (!cryo_decompress(method, compressed, compressed_size, entry->data))
@@ -213,8 +220,18 @@ allocate_cache_slot(PageId *pageId)
     return item;
 }
 
+static inline void
+mark_cached_blocks_read(SeqScanIterator *iter, BlockNumber *blocks, uint nblocks)
+{
+    int i;
+
+    for (i = 0; i < nblocks; ++i)
+        cryo_seqscan_iter_exclude(iter, blocks[i], true);
+}
+
 CryoError
-cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
+cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
+               CacheEntry *result)
 {
     bool    found;
     PageId  pageId = {
@@ -247,12 +264,19 @@ cryo_read_data(Relation rel, BlockNumber blockno, CacheEntry *result)
         cache[item->entry].ts = get_current_timestamp_ms();
         cache[item->entry].key = item->key;
         cache[item->entry].pinned = false;
-        err = cryo_read_decompress(rel, blockno, &cache[item->entry]);
+        cache[item->entry].nblocks = 0;
+        err = cryo_read_decompress(rel, iter, blockno, &cache[item->entry]);
         if (err != CRYO_ERR_SUCCESS)
         {
             *result = item->entry = InvalidCacheEntry;
             return err;
         }
+    }
+    else
+    {
+        mark_cached_blocks_read(iter,
+                                cache[item->entry].blocks,
+                                cache[item->entry].nblocks);
     }
 
     *result = item->entry;
@@ -302,6 +326,7 @@ cryo_cache_release(CacheEntry entry)
         elog(ERROR, "pg_cryogen: invalid cache entry");
 
     slot->ts = 0;
+    slot->pinned = false;
 }
 
 uint32

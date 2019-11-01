@@ -5,6 +5,8 @@
 #include "storage/block.h"
 #include "utils/relcache.h"
 
+#include "scan_iterator.h"
+
 
 #define InvalidCacheEntry -1
 
@@ -20,7 +22,8 @@ typedef enum
 typedef int CacheEntry;
 
 void cryo_init_cache(void);
-CryoError cryo_read_data(Relation rel, BlockNumber block, CacheEntry *result);
+CryoError cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber block,
+                         CacheEntry *result);
 CacheEntry cryo_cache_allocate(Relation rel, BlockNumber blockno);
 void cryo_cache_release(CacheEntry entry);
 
