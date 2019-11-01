@@ -64,6 +64,13 @@ cryo_seqscan_iter_next(SeqScanIterator *iter)
     /* take the first element of the first range */
     r = linitial(iter->ranges);
     res = r->start++;
+
+    /*
+     * Remove first block from iterator
+     *
+     * XXX probably let the client code to call cryo_seqscan_iter_exclude()
+     * explicitly
+     */
     if (r->start > r->end)
         list_delete_ptr(iter->ranges, r);
 

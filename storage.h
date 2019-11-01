@@ -33,7 +33,6 @@ typedef struct
 {
     PageHeaderData  base;           /* we don't use it, but it is required by
                                      * GenericXLogFinish() */
-    //uint16          curpage;
     BlockNumber     first;
     BlockNumber     next;
 } CryoPageHeader;

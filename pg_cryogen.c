@@ -434,14 +434,9 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     CryoError       err;
 
     cscan->cur_block = MAX(1, cscan->cur_block);  /* initial case */
-
-    /* prevent reading in the middle of cryo blocks */
-    if (tbmres->blockno < cscan->cur_block + cscan->nblocks)
-        return false;
-
     blockno = tbmres->blockno;
 
-    err = cryo_read_data(cscan->rs_base.rs_rd, cscan->iterator, blockno,
+    err = cryo_read_data(cscan->rs_base.rs_rd, NULL, blockno,
                          &cscan->cacheEntry);
     switch (err)
     {
@@ -475,7 +470,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     {
         /*
          * ...and for non-lossy cur_item points to the position in
-         * tmbres->offsets.
+         * tbmres->offsets.
          */
         cscan->cur_item = 0;
     }
@@ -978,7 +973,6 @@ static bool
 cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
                              BufferAccessStrategy bstrategy)
 {
-#if 0
     CryoPageHeader *page;
     CryoScanDesc    cscan = (CryoScanDesc) scan;
     Buffer          buf;
@@ -997,14 +991,16 @@ cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
     buf = ReadBuffer(cscan->rs_base.rs_rd, blockno);
     LockBuffer(buf, BUFFER_LOCK_SHARE);
     page = (CryoPageHeader *) BufferGetPage(buf);
-    blockno = blockno - page->curpage;
+    //blockno = blockno - page->curpage;
+    blockno = page->first;
     UnlockReleaseBuffer(buf);
 
     /* Do not scan the same block twice */
     if (blockno == cscan->cur_block)
         return false;
 
-    err = cryo_read_data(cscan->rs_base.rs_rd, blockno, &cscan->cacheEntry);
+    err = cryo_read_data(cscan->rs_base.rs_rd, cscan->iterator, blockno,
+                         &cscan->cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
         elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
 
@@ -1015,7 +1011,6 @@ cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 
     cscan->cur_block = blockno;
     cscan->cur_item = 1;
-#endif
     return true;
 }
 
@@ -1292,11 +1287,11 @@ static void
 cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                 BufferAccessStrategy bstrategy)
 {
-#if 0
     int         npages = RelationGetNumberOfBlocks(onerel);
-    BlockNumber blkno;
+    BlockNumber     blkno;
     TransactionId   oldest_xmin, freeze_limit, xid_full_scan_limit;
     MultiXactId     multi_xact_cutoff, multi_xact_full_scan_limit;
+    SeqScanIterator *iter;
 
     if (params->options & VACOPT_FULL)
         elog(ERROR, "pg_cryogen: VACUUM FULL is not implemented");
@@ -1309,24 +1304,32 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
                           &oldest_xmin, &freeze_limit, &xid_full_scan_limit,
                           &multi_xact_cutoff, &multi_xact_full_scan_limit);
 
+    iter = cryo_seqscan_iter_create();
+    blkno = cryo_seqscan_iter_next(iter);
+
     while (blkno < npages)
     {
-        CryoFirstPageHeader *page;
+        CryoFirstPageHeader *first_page;
+        CryoPageHeader      *page;
         Buffer      buf;
         Buffer      vmbuf = InvalidBuffer;
         uint8       vmflags;
 
         buf = ReadBuffer(onerel, blkno);
         LockBuffer(buf, BUFFER_LOCK_SHARE);
-        page = (CryoFirstPageHeader *) BufferGetPage(buf);
+        first_page = (CryoFirstPageHeader *) BufferGetPage(buf);
 
-        Assert(page->cryo_base.curpage == 0);
+        /* skip empty pages */
+        if (PageIsNew((PageHeader *) first_page))
+        {
+            UnlockReleaseBuffer(buf);
+            blkno = cryo_seqscan_iter_next(iter);
+        }
 
         vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
-
         if (!(vmflags & VISIBILITYMAP_ALL_FROZEN))
         {
-            if (TransactionIdPrecedes(page->created_xid, freeze_limit))
+            if (TransactionIdPrecedes(first_page->created_xid, freeze_limit))
             {
                 /* Freeze page by setting bit in visibility map */ 
                 visibilitymap_pin(onerel, blkno, &vmbuf);
@@ -1342,13 +1345,29 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             }
         }
 
+        /*
+         * Mark the rest pages as read. Not optimal way to do it, but the only
+         * solution I came up with so far.
+         */
+        page = (CryoPageHeader *) first_page;
+        while (BlockNumberIsValid(page->next))
+        {
+            Buffer  b;
+
+            blkno = page->next;
+            b = ReadBuffer(onerel, blkno);
+            LockBuffer(b, BUFFER_LOCK_SHARE);
+            page = (CryoPageHeader *) BufferGetPage(b);
+            cryo_seqscan_iter_exclude(iter, blkno, false);
+            UnlockReleaseBuffer(b);
+        }
+
         if (BufferIsValid(vmbuf))
             ReleaseBuffer(vmbuf);
         UnlockReleaseBuffer(buf);
 
-        blkno += page->npages;
+        blkno = cryo_seqscan_iter_next(iter);
     }
-#endif
 }
 
 /*
