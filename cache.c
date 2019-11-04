@@ -39,6 +39,7 @@ typedef struct
     bool        pinned;     /* cache entry cannot be evicted when true */
     TS          ts;         /* timestamp for LRU */
     uint32      nblocks;    /* number of postgres blocks */
+                            /* TODO: absolete */
     TransactionId xid;      /* transaction created block */
     BlockNumber blocks[CRYO_BLCKSZ / BLCKSZ];   /* cache block numbers *
                                                  * for SeqScanIterator */

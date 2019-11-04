@@ -44,3 +44,7 @@ Both index scan and bitmap scans are implemented.
 * `pg_cryogen.zstd_compression_level`: `zstd` specific parameter for compression level; valid values are [-5..22] (default is 1).
 
 Those GUCs can be set in either in postgresql.conf or for any particular session.
+
+## Internals
+
+Please refer to a separate [document](internals.md) for details.
