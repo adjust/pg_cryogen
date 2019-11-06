@@ -108,6 +108,7 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
     char       *compressed, *p;
     Size        compressed_size, size;
     uint8       vmflags;
+    BlockNumber first_block = block;
 
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
@@ -156,17 +157,19 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
         memcpy(p, page_content, l);
         p += l;
         size -= l;
+        block = page->next;
         ReleaseBuffer(buf);
 
         if (size == 0)
             break;
 
         /* read the next block */
-        if (!BlockNumberIsValid(page->next))
+        if (!BlockNumberIsValid(block))
             break;
-        block = page->next;
         buf = ReadBuffer(rel, block);
         page = (CryoPageHeader *) BufferGetPage(buf);
+        Assert(page->first == first_block);
+
         cryo_seqscan_iter_exclude(iter, block, false);
         entry->blocks[entry->nblocks++] = block;
     }

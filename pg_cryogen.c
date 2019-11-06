@@ -564,8 +564,10 @@ cryo_load_meta(Relation rel, int lockmode)
         GenericXLogState *xlogState = GenericXLogStart(rel);
 
         /* This is a brand new relation. Initialize a metapage */
+        LockRelationForExtension(rel, ExclusiveLock);
         metabuf = ReadBuffer(rel, P_NEW);
         LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+        UnlockRelationForExtension(rel, ExclusiveLock);
         metapage = (CryoMetaPage *)
             GenericXLogRegisterBuffer(xlogState, metabuf,
                                       GENERIC_XLOG_FULL_IMAGE);
@@ -598,7 +600,9 @@ cryo_reserve_blockno(Relation rel)
     Buffer      buf;
     BlockNumber res;
 
+    LockRelationForExtension(rel, ExclusiveLock);
     buf = ReadBuffer(rel, P_NEW);
+    UnlockRelationForExtension(rel, ExclusiveLock);
     res = BufferGetBlockNumber(buf);
     ReleaseBuffer(buf);
 
@@ -738,6 +742,16 @@ cryo_preserve(CryoModifyState *state, bool advance)
 
     block = MAX(1, block);
 
+    /*
+     * If we need more than one page then lock relation for extension
+     *
+     * XXX don't need to do that for local relations but thats unlikely
+     * the case 
+     */
+    if (npages > 1)
+        LockRelationForExtension(state->relation, ExclusiveLock);
+
+    /* allocate and lock bufferes */
     for (i = 0; i < npages; ++i)
     {
         /* the first block was preallocated in init_modify_state */
@@ -747,7 +761,10 @@ cryo_preserve(CryoModifyState *state, bool advance)
         /* but the rest of the blocks must be allocated here */
         block = P_NEW;
     }
+    if (npages > 1)
+        UnlockRelationForExtension(state->relation, ExclusiveLock);
 
+    /* copy data into buffers and release them*/
     for (i = 0; i < npages; ++i)
     {
         CryoPageHeader *hdr;
