@@ -92,7 +92,8 @@ get_current_timestamp_ms(void)
  *      CRYO_ERR_SUCCESS: success;
  *      CRYO_ERR_WRONG_STARTING_BLOCK: specified blockno is not a starting
  *          block of cryo page;
- *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure.
+ *      CRYO_ERR_DECOMPRESSION_FAILED: decompression failure;
+ *      CRYO_ERR_EMPTY_BLOCK: specified block is empty.
  *
  * XXX Move visibility check here to avoid unnecessary i/o.
  */
@@ -110,6 +111,12 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
 
     buf = ReadBuffer(rel, block);
     page = (CryoPageHeader *) BufferGetPage(buf);
+
+    if (PageIsNew(page))
+    {
+        ReleaseBuffer(buf);
+        return CRYO_ERR_EMPTY_BLOCK;
+    }
 
     /*
      * In case of brin index bitmap scan can try to read data not from the

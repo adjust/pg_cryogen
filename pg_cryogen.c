@@ -291,7 +291,14 @@ read_block:
         err = cryo_read_data(rel, scan->iterator, scan->cur_block,
                              &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
+        {
+            if (err == CRYO_ERR_EMPTY_BLOCK)
+            {
+                /* that's ok, just read the next block*/
+                goto read_block;
+            }
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+        }
         scan->nblocks = cryo_cache_get_pg_nblocks(scan->cacheEntry);
         scan->cur_item = 1;
 
@@ -1002,7 +1009,11 @@ cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
     err = cryo_read_data(cscan->rs_base.rs_rd, cscan->iterator, blockno,
                          &cscan->cacheEntry);
     if (err != CRYO_ERR_SUCCESS)
+    {
+        if (err == CRYO_ERR_EMPTY_BLOCK)
+            return false;
         elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+    }
 
     /*
      * XXX scan->rs_snapshot is NULL here so visibility is checked in
