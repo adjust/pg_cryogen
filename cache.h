@@ -27,6 +27,7 @@ CryoError cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber block,
                          CacheEntry *result);
 CacheEntry cryo_cache_allocate(Relation rel, BlockNumber blockno);
 void cryo_cache_release(CacheEntry entry);
+void cryo_cache_invalidate_relation(Oid relid);
 
 uint32 cryo_cache_get_pg_nblocks(CacheEntry entry);
 char *cryo_cache_get_data(CacheEntry entry);

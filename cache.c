@@ -261,7 +261,8 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
     /* check with hashtable */
     item = hash_search(pagemap, &pageId, HASH_FIND, &found);
 
-    if (!found || item->entry == InvalidCacheEntry)
+    /* TODO: rewrite condition */
+    if (!found || item->entry == InvalidCacheEntry || cache[item->entry].ts == 0)
     {
         CryoError   err;
 
@@ -338,6 +339,18 @@ cryo_cache_release(CacheEntry entry)
 
     slot->ts = 0;
     slot->pinned = false;
+}
+
+void
+cryo_cache_invalidate_relation(Oid relid)
+{
+    int     i;
+
+    for (i = 0; i < CACHE_SIZE; ++i)
+    {
+        if (cache[i].key.relid == relid)
+            cache[i].ts = 0;
+    }
 }
 
 uint32

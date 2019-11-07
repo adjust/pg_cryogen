@@ -20,6 +20,7 @@
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/inval.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
@@ -186,12 +187,19 @@ cryo_xact_callback(XactEvent event, void *arg)
     }
 }
 
+static void
+cryo_relcache_callback(Datum arg, Oid relid)
+{
+    cryo_cache_invalidate_relation(relid);
+}
+
 void
 _PG_init(void)
 {
     cryo_init_cache();
     cryo_define_compression_gucs();
     RegisterXactCallback(cryo_xact_callback, NULL);
+    CacheRegisterRelcacheCallback(cryo_relcache_callback, (Datum) 0);
 }
 
 static const TupleTableSlotOps *
