@@ -297,7 +297,10 @@ read_block:
                 /* that's ok, just read the next block*/
                 goto read_block;
             }
-            elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("pg_cryogen: %s", cryo_cache_err(err)),
+                     errhint("block number: %u", scan->cur_block)));
         }
         scan->nblocks = cryo_cache_get_pg_nblocks(scan->cacheEntry);
         scan->cur_item = 1;
@@ -561,31 +564,44 @@ cryo_load_meta(Relation rel, int lockmode)
 
     if (RelationGetNumberOfBlocks(rel) == 0)
     {
-        GenericXLogState *xlogState = GenericXLogStart(rel);
+        GenericXLogState *xlogState;
 
         /* This is a brand new relation. Initialize a metapage */
         LockRelationForExtension(rel, ExclusiveLock);
-        metabuf = ReadBuffer(rel, P_NEW);
-        LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-        UnlockRelationForExtension(rel, ExclusiveLock);
-        metapage = (CryoMetaPage *)
-            GenericXLogRegisterBuffer(xlogState, metabuf,
-                                      GENERIC_XLOG_FULL_IMAGE);
 
         /*
-         * Can't leave pd_upper = 0 because then page will be considered new
-         * (see PageIsNew) and won't pass PageIsVerified check
+         * Check that while we where locking relation nobody else has created
+         * metapage. Because that would be just terrible.
          */
-        metapage->base.pd_upper = BLCKSZ;
-        metapage->base.pd_lower = sizeof(CryoMetaPage);
-        metapage->base.pd_special = BLCKSZ;
-        metapage->version = STORAGE_VERSION;
+        if (RelationGetNumberOfBlocks(rel) == 0)
+        {
+            xlogState = GenericXLogStart(rel);
+            metabuf = ReadBuffer(rel, P_NEW);
+            LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+            UnlockRelationForExtension(rel, ExclusiveLock);
+            metapage = (CryoMetaPage *)
+                GenericXLogRegisterBuffer(xlogState, metabuf,
+                                          GENERIC_XLOG_FULL_IMAGE);
 
-        /* No target block yet */
-        metapage->target_block = 0;
+            /*
+             * Can't leave pd_upper = 0 because then page will be considered new
+             * (see PageIsNew) and won't pass PageIsVerified check
+             */
+            metapage->base.pd_upper = BLCKSZ;
+            metapage->base.pd_lower = sizeof(CryoMetaPage);
+            metapage->base.pd_special = BLCKSZ;
+            metapage->version = STORAGE_VERSION;
 
-        GenericXLogFinish(xlogState);
-        UnlockReleaseBuffer(metabuf);
+            /* No target block yet */
+            metapage->target_block = 0;
+
+            GenericXLogFinish(xlogState);
+            UnlockReleaseBuffer(metabuf);
+        }
+        else
+        {
+            UnlockRelationForExtension(rel, ExclusiveLock);
+        }
     }
 
     metabuf = ReadBuffer(rel, CRYO_META_PAGE);
