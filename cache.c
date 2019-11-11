@@ -168,6 +168,7 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
             break;
         buf = ReadBuffer(rel, block);
         page = (CryoPageHeader *) BufferGetPage(buf);
+
         Assert(page->first == first_block);
 
         cryo_seqscan_iter_exclude(iter, block, false);

@@ -17,6 +17,7 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
+#include "storage/checksum.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
@@ -602,6 +603,7 @@ cryo_load_meta(Relation rel, int lockmode)
 
             /* No target block yet */
             metapage->target_block = 0;
+            PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
 
             GenericXLogFinish(xlogState);
             UnlockReleaseBuffer(metabuf);
@@ -613,6 +615,7 @@ cryo_load_meta(Relation rel, int lockmode)
     }
 
     metabuf = ReadBuffer(rel, CRYO_META_PAGE);
+    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
     LockBuffer(metabuf, lockmode);
 
     return metabuf;
@@ -812,10 +815,10 @@ cryo_preserve(CryoModifyState *state, bool advance)
             first_hdr->compressed_size = size;
             first_hdr->created_xid = GetCurrentTransactionId();
         }
-        hdr_size = CryoPageHeaderSize(hdr, BufferGetBlockNumber(buffers[i]));
+        block = BufferGetBlockNumber(buffers[i]);
+        hdr_size = CryoPageHeaderSize(hdr, block);
         content_size = BLCKSZ - hdr_size;
 
-        hdr->base.pd_checksum = 0; /* TODO */
         /*
          * Can't leave pd_upper = 0 because then page will be considered new
          * (see PageIsNew) and won't pass PageIsVerified check
@@ -826,6 +829,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
         memcpy((char *) hdr + hdr_size,
                p,
                MIN(content_size, size));
+        PageSetChecksumInplace((Page) hdr, block);
 
         size -= content_size;
         p += content_size;
@@ -845,6 +849,8 @@ cryo_preserve(CryoModifyState *state, bool advance)
 #endif
     metapage->target_block = state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
+    PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
+
     MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
 
