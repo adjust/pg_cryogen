@@ -1,4 +1,4 @@
-[WIP]
+[![Build Status](https://travis-ci.org/adjust/pg_cryogen.svg?branch=master)](https://travis-ci.org/adjust/pg_cryogen) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
 # pg_cryogen
 
@@ -10,7 +10,7 @@
 
 ## Build
 
-Like with any other postgres extensions after clone just run in command line:
+After clone just run in command line:
 
 ```
 make install
