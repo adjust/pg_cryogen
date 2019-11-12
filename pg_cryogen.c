@@ -41,16 +41,6 @@ PG_MODULE_MAGIC;
         elog(ERROR, "function \"%s\" is not implemented", __func__); \
     } while (0)
 
-/*
- * There were old implementation that continues to write new tuples in the
- * last block. It wasn't very relyable as if there is an error somewhere 
- * between writes of pages of one block we'd end up with a broken storage with
- * half new pages and half old. To fix that we now write new tuples into a new
- * block on every multi_insert. It's a bit less space efficient but more
- * durable. To keep previous implementation just in case this define was
- * introduced.
- */
-#define ONE_WRITE_ONE_BLOCK
 
 typedef struct CryoScanDescData
 {
@@ -98,18 +88,7 @@ flush_modify_state(void)
         return;
 
     if (modifyState.tuples_inserted)
-    {
-#ifdef ONE_WRITE_ONE_BLOCK
-        /*
-         * Advance target_block so that next tuple will be written into a new
-         * block and not into the same. Read comment on ONE_WRITE_ONE_BLOCK for
-         * details.
-         */
         cryo_preserve(&modifyState, true);
-#else
-        cryo_preserve(&modifyState, false);
-#endif
-    }
     modifyState.tuples_inserted = 0;
 
     cryo_cache_release(modifyState.cacheEntry);
@@ -151,7 +130,6 @@ init_modify_state(Relation rel)
     }
     else
     {
-#ifdef ONE_WRITE_ONE_BLOCK
         /*
          * In order to ensure that storage is  consistent we create entirely
          * new block for every multi_insert instead of adding tuples to an
@@ -159,10 +137,6 @@ init_modify_state(Relation rel)
          * faster: we just check transaction id in a block header.
          */
         cryo_init_page(hdr);
-#else
-        /* Read the target block contents into modifyState.data */
-        cryo_read_data(rel, NULL, modifyState.target_block,  modifyState.data);
-#endif
     }
     modifyState.relation = rel;
     modifyState.tuples_inserted = 0;
@@ -843,10 +817,8 @@ cryo_preserve(CryoModifyState *state, bool advance)
     metapage = (CryoMetaPage *)
         GenericXLogRegisterBuffer(xlog_state, metabuf,
                                   GENERIC_XLOG_FULL_IMAGE);
-#ifdef ONE_WRITE_ONE_BLOCK
     if (advance)
         block += i;
-#endif
     metapage->target_block = state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
     PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
@@ -858,11 +830,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
     for (i = 0; i < npages; ++i)
         UnlockReleaseBuffer(buffers[i]);
     UnlockReleaseBuffer(metabuf);
-
-#ifndef ONE_WRITE_ONE_BLOCK
-    if (advance)
-        state->target_block = state->target_block + i;
-#endif
 }
 
 static void
