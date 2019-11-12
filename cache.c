@@ -4,6 +4,7 @@
 #include "compression.h"
 #include "storage.h"
 
+#include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"

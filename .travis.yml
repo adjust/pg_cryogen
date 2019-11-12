@@ -1,0 +1,14 @@
+sudo: required
+
+language: c
+
+services: docker
+
+install:
+    - docker build . -t tests --build-arg PG_VERSION=${PG_VERSION}
+
+script:
+    - docker run tests
+
+env:
+    - PG_VERSION=12
