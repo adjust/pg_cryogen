@@ -5,7 +5,7 @@ FROM postgres:${PG_VERSION}-alpine
 ENV LANG=C.UTF-8 PGDATA=/pg/data
 
 # Install dependencies
-RUN apk add --no-cache make musl-dev gcc lz4-dev zstd-dev
+RUN apk add --no-cache make musl-dev gcc lz4-dev zstd-dev curl git
 
 # Make directories
 RUN	mkdir -p ${PGDATA} && \

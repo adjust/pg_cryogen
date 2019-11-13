@@ -4,9 +4,10 @@ set -ux
 
 # global exports
 export PGPORT=55435
+export CODECOV_TOKEN="26c616a7-e2aa-4b0e-a0c1-416b63e3457c"
 
 # build extension
-make install
+make install CFLAGS='-coverage'
 
 # initialize database
 initdb -D $PGDATA
@@ -23,6 +24,10 @@ make installcheck
 
 # show diff if needed and exit if something's wrong
 [[ $? -ne 0 ]] && { [[ -f regression.diffs ]] && cat regression.diffs ; exit 1 ; }
+
+# report to codecov
+gcov *.c *.h
+bash <(curl -s https://codecov.io/bash)
 
 set +ux
 
