@@ -628,6 +628,11 @@ cryo_multi_insert_internal(Relation rel,
         /*
          * Flush whatever changes we currently have in the modifyState and
          * reinitialize it for a new relation.
+         *
+         * XXX: that isn't the optimal solution in case when user inserts
+         * into several tables out of order in a single transaction. Other
+         * option would be to have separate cache slot for every table we are
+         * inserting to, but then there is a risk to exhaust all cache slots.
          */
         flush_modify_state();
         init_modify_state(rel);

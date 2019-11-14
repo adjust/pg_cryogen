@@ -124,3 +124,43 @@ SELECT * FROM data JOIN other_table USING (id) LIMIT 3;
   1 | c4ca4238a0b923820dcc509a6f75849b | 01-02-2000
 (1 row)
 
+-- test tables with wide records which would require more than one postgres page
+-- for cryo block
+CREATE TABLE json_data(data jsonb) USING pg_cryogen;
+BEGIN;
+INSERT INTO json_data VALUES ('{"test": 1}'::jsonb);
+ROLLBACK;
+INSERT INTO json_data
+SELECT ('
+{
+    "id": ' || gs || ',
+    "a": "' || md5(gs::text || 'a') || '",
+    "b": "' || md5(gs::text || 'b') || '",
+    "c": "' || md5(gs::text || 'c') || '",
+    "d": "' || md5(gs::text || 'd') || '",
+    "e": "' || md5(gs::text || 'e') || '",
+    "f": "' || md5(gs::text || 'f') || '",
+    "g": "' || md5(gs::text || 'g') || '",
+    "h": "' || md5(gs::text || 'h') || '",
+    "i": "' || md5(gs::text || 'i') || '",
+    "j": "' || md5(gs::text || 'j') || '",
+    "k": "' || md5(gs::text || 'k') || '",
+    "l": "' || md5(gs::text || 'l') || '",
+    "m": "' || md5(gs::text || 'm') || '",
+    "n": "' || md5(gs::text || 'n') || '",
+    "o": "' || md5(gs::text || 'o') || '",
+    "p": "' || md5(gs::text || 'p') || '",
+    "q": "' || md5(gs::text || 'q') || '",
+    "r": "' || md5(gs::text || 'r') || '",
+    "s": "' || md5(gs::text || 's') || '",
+    "t": "' || md5(gs::text || 't') || '",
+    "u": "' || md5(gs::text || 'u') || '",
+    "v": "' || md5(gs::text || 'v') || '",
+    "w": "' || md5(gs::text || 'w') || '",
+    "x": "' || md5(gs::text || 'x') || '",
+    "y": "' || md5(gs::text || 'y') || '",
+    "z": "' || md5(gs::text || 'z') || '"
+}')::jsonb
+FROM generate_series(1, 300) as gs;
+SELECT count(*) FROM json_data;
+ERROR:  pg_cryogen: iternal error; block 3 is not the part of seqscan iterator
