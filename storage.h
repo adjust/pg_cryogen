@@ -9,6 +9,7 @@
 
 
 #define STORAGE_VERSION     1
+#define CRYO_META_PAGE      0
 
 /*
  * XXX probably it makes sense to make page size configurable for each table

@@ -33,7 +33,6 @@
 
 PG_MODULE_MAGIC;
 
-#define CRYO_META_PAGE 0
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define NOT_IMPLEMENTED \
@@ -426,7 +425,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
     BlockNumber     blockno;
     CryoError       err;
 
-    cscan->cur_block = MAX(1, cscan->cur_block);  /* initial case */
+    cscan->cur_block = InvalidBlockNumber;
     blockno = tbmres->blockno;
 
     err = cryo_read_data(cscan->rs_base.rs_rd, NULL, blockno,

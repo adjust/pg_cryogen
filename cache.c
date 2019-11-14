@@ -254,7 +254,7 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
     PageIdCacheEntry *item;
 
      /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
-    if (RelationGetNumberOfBlocks(rel) <= blockno)
+    if (RelationGetNumberOfBlocks(rel) <= blockno || blockno == CRYO_META_PAGE)
     {
         *result = InvalidCacheEntry;
         return CRYO_ERR_WRONG_STARTING_BLOCK;
@@ -351,7 +351,10 @@ cryo_cache_invalidate_relation(Oid relid)
     for (i = 0; i < CACHE_SIZE; ++i)
     {
         if (cache[i].key.relid == relid)
+        {
+            hash_search(pagemap, &cache[i].key, HASH_REMOVE, NULL);
             cache[i].ts = 0;
+        }
     }
 }
 
