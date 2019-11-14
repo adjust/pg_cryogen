@@ -6,7 +6,7 @@
 
 ## Dependencies
 
-`pg_cryogen` requires `liblz4` and `libzstd` installed.
+`pg_cryogen` requires `liblz4` and `libzstd` development packages installed.
 
 ## Build
 

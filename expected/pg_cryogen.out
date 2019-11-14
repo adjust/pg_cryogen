@@ -2,7 +2,7 @@ CREATE EXTENSION pg_cryogen;
 CREATE TEMPORARY TABLE tmp_data
 AS SELECT gs as id, md5(gs::TEXT) as msg FROM generate_series(1, 500) as gs;
 COPY tmp_data TO '/tmp/pg_cryogen_data.csv' WITH csv;
-CREATE TABLE data (id INT4, msg TEXT) USING pg_cryogen;
+CREATE TABLE data (id INT4 NOT NULL, msg TEXT) USING pg_cryogen;
 COPY data FROM '/tmp/pg_cryogen_data.csv' WITH csv;
 SELECT * FROM data LIMIT 10;
  id |               msg                
@@ -64,6 +64,8 @@ SELECT * FROM data WHERE id = 500;
  500 | cee631121c2ec9232f3a2f028ad5c89b
 (1 row)
 
+SET enable_seqscan = t;
+SET pg_cryogen.compression_method = 'lz4';
 COPY data FROM '/tmp/pg_cryogen_data.csv' WITH csv;
 SELECT count(*) FROM data;
  count 
@@ -72,3 +74,53 @@ SELECT count(*) FROM data;
 (1 row)
 
 VACUUM data;
+-- inserts
+TRUNCATE data;
+INSERT INTO data
+SELECT gs as id, md5(gs::TEXT) as msg FROM generate_series(1, 500) as gs;
+-- check FKs
+DROP INDEX data_id_idx;
+CREATE UNIQUE INDEX data_id_idx ON data USING btree (id);
+CREATE TABLE ref_table (id SERIAL, data_id INT4 REFERENCES data (id));
+INSERT INTO ref_table VALUES (1, 50), (2, 100), (3, 250); -- cryo_tuple_lock is called here
+EXPLAIN (COSTS OFF) SELECT * FROM data JOIN ref_table ON data_id = data.id;
+                 QUERY PLAN                 
+--------------------------------------------
+ Hash Join
+   Hash Cond: (ref_table.data_id = data.id)
+   ->  Seq Scan on ref_table
+   ->  Hash
+         ->  Seq Scan on data
+(5 rows)
+
+SELECT * FROM data JOIN ref_table ON data_id = data.id LIMIT 3;
+ id  |               msg                | id | data_id 
+-----+----------------------------------+----+---------
+  50 | c0c7c76d30bd3dcaefc96f40275bdc0a |  1 |      50
+ 100 | f899139df5e1059396431415e770c6dd |  2 |     100
+ 250 | 6c9882bbac1c7093bd25041881277658 |  3 |     250
+(3 rows)
+
+DROP TABLE ref_table;
+DROP INDEX data_id_idx;
+-- check rescan
+CREATE TABLE other_table AS
+SELECT gs as id, '2000-01-01'::DATE + gs as dt FROM generate_series(1, 500) as gs;
+SET enable_hashjoin = f;
+SET enable_mergejoin = f;
+SET enable_material = f;
+EXPLAIN (COSTS OFF) SELECT * FROM data JOIN other_table USING (id);
+                QUERY PLAN                 
+-------------------------------------------
+ Nested Loop
+   Join Filter: (data.id = other_table.id)
+   ->  Seq Scan on other_table
+   ->  Seq Scan on data
+(4 rows)
+
+SELECT * FROM data JOIN other_table USING (id) LIMIT 3;
+ id |               msg                |     dt     
+----+----------------------------------+------------
+  1 | c4ca4238a0b923820dcc509a6f75849b | 01-02-2000
+(1 row)
+
