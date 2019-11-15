@@ -21,8 +21,6 @@ typedef struct
 {
     PageHeaderData  base;           /* to keep PageIsVerified quiet */
     uint16          version;        /* storage version */
-    uint32          target_block;   /* the last block we inserted to;
-                                     * zero if we haven't yet */
     uint64          ntuples;        /* total number of tuples in relation */
 } CryoMetaPage;
 

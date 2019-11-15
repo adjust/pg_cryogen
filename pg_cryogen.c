@@ -47,7 +47,6 @@ typedef struct CryoScanDescData
     uint32              nblocks;
     BlockNumber         cur_block;
     uint32              cur_item;
-    BlockNumber         target_block;
     SeqScanIterator    *iterator;
     CacheEntry          cacheEntry; /* cached decompressed page reference */
 } CryoScanDescData;
@@ -190,8 +189,6 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
                uint32 flags)
 {
     CryoScanDesc    scan;
-    Buffer          metabuf;
-    CryoMetaPage   *metapage;
 
 	RelationIncrementReferenceCount(relation);
 
@@ -209,11 +206,6 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->nblocks = 0;
     scan->cacheEntry = InvalidCacheEntry; 
     scan->iterator = cryo_seqscan_iter_create();
-
-    metabuf = cryo_load_meta(relation, BUFFER_LOCK_SHARE);
-    metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-    scan->target_block = metapage->target_block;
-    UnlockReleaseBuffer(metabuf);
 
     return (TableScanDesc) scan;
 }
@@ -575,7 +567,6 @@ cryo_load_meta(Relation rel, int lockmode)
             metapage->version = STORAGE_VERSION;
 
             /* No target block yet */
-            metapage->target_block = 0;
             PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
 
             GenericXLogFinish(xlogState);
@@ -823,7 +814,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
                                   GENERIC_XLOG_FULL_IMAGE);
     if (advance)
         block += i;
-    metapage->target_block = state->target_block = block;
+    state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
     PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
 
