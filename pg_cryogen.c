@@ -653,6 +653,7 @@ cryo_multi_insert_internal(Relation rel,
                 elog(ERROR, "tuple is too large to fit the cryo block");
             }
         }
+        pfree(tuple);
         modifyState.tuples_inserted++;
 
         slots[i]->tts_tableOid = RelationGetRelid(rel);
@@ -821,10 +822,12 @@ cryo_preserve(CryoModifyState *state, bool advance)
     MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
 
-    /* Release all affected buffers */
+    /* Release resources */
     for (i = 0; i < npages; ++i)
         UnlockReleaseBuffer(buffers[i]);
     UnlockReleaseBuffer(metabuf);
+    pfree(buffers);
+    pfree(compressed);
 }
 
 static void
