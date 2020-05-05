@@ -1209,11 +1209,14 @@ cryo_index_build_range_scan(Relation rel,
                        isnull);
 
         /* Call the AM's callback routine to process the tuple */
+#if PG_VERSION_NUM < 130000
         tuple = ExecCopySlotHeapTuple(slot);
         tuple->t_self = slot->tts_tid;
         callback(indexRelation, tuple, values, isnull, true, callback_state);
-
         pfree(tuple);
+#else
+        callback(indexRelation, &slot->tts_tid, values, isnull, true, callback_state);
+#endif
     }
 
     if (progress)

@@ -81,6 +81,7 @@ void
 cryo_seqscan_iter_exclude(SeqScanIterator *iter, BlockNumber block, bool miss_ok)
 {
     ListCell   *lc;
+    int         pos = 0;
 
     if (!iter)
         return;
@@ -103,7 +104,11 @@ cryo_seqscan_iter_exclude(SeqScanIterator *iter, BlockNumber block, bool miss_ok
                 new_r->start = block + 1;
                 new_r->end = r->end;
                 r->end = block - 1;
+#if PG_VERSION_NUM < 130000
                 lappend_cell(iter->ranges, lc, new_r);
+#else
+                list_insert_nth(iter->ranges, pos + 1, new_r);
+#endif
                 return;
             }
 
@@ -111,6 +116,8 @@ cryo_seqscan_iter_exclude(SeqScanIterator *iter, BlockNumber block, bool miss_ok
                 list_delete_ptr(iter->ranges, r);
             return;
         }
+
+        pos++;
     }
 
     if (!miss_ok)
