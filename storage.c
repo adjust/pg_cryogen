@@ -56,7 +56,6 @@ HeapTuple
 cryo_storage_fetch(CryoDataHeader *d, int pos, HeapTuple tuple)
 {
     CryoItemId *itemId;
-    //HeapTuple tuple = palloc0(sizeof(HeapTuple));
 
     /* input pos is 1 based */
     itemId = (CryoItemId *) d->data + pos - 1;

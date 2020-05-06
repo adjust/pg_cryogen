@@ -17,9 +17,27 @@
  */
 #define CRYO_BLCKSZ (1 << 20)   /* 1Mb */
 
+/*
+ * PageHeaderData clone with only difference that it doesn't have flexible
+ * array member `pd_linp` which allows to add it as a member to other structs.
+ * It has the same length and the same structure as PageHeaderData so they are
+ * mutually convertable.
+ */
 typedef struct
 {
-    PageHeaderData  base;           /* to keep PageIsVerified quiet */
+    PageXLogRecPtr  pd_lsn;
+    uint16          pd_checksum;
+    uint16          pd_flags;
+    LocationIndex   pd_lower;
+    LocationIndex   pd_upper;
+    LocationIndex   pd_special;
+    uint16          pd_pagesize_version;
+    TransactionId   pd_prune_xid;
+} PageHeaderClone;
+
+typedef struct
+{
+    PageHeaderClone base;           /* to keep PageIsVerified quiet */
     uint16          version;        /* storage version */
     uint64          ntuples;        /* total number of tuples in relation */
 } CryoMetaPage;
@@ -30,7 +48,7 @@ typedef struct
  */
 typedef struct
 {
-    PageHeaderData  base;           /* we don't use it, but it is required by
+    PageHeaderClone base;           /* we don't use it, but it is required by
                                      * GenericXLogFinish() */
     BlockNumber     first;
     BlockNumber     next;
