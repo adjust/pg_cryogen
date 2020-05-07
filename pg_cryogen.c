@@ -693,19 +693,15 @@ static inline uint8
 cryo_pages_needed(Size size)
 {
     int     pages = 1;
+    Size    page_sz = BLCKSZ  - sizeof(CryoPageHeader);
 
     Assert(size > 0);
 
-    size -= MIN(BLCKSZ - sizeof(CryoFirstPageHeader), size);
-
-    while (size > 0)
-    {
-        size -= MIN(BLCKSZ - sizeof(CryoPageHeader), size);
-        pages++;
-    }
+    size -= BLCKSZ - sizeof(CryoFirstPageHeader);
+    pages += size > 0 ? (size + page_sz - 1) / page_sz : 0;
 
     return pages;
-};
+}
 
 /*
  * Compress and store data in postgres buffers, write WAL and all that stuff.
@@ -1178,7 +1174,9 @@ cryo_index_build_range_scan(Relation rel,
 
     while (cryo_getnextslot(scan, ForwardScanDirection, slot))
     {
+#if PG_VERSION_NUM < 130000
         HeapTuple   tuple;
+#endif
 
         CHECK_FOR_INTERRUPTS();
 
