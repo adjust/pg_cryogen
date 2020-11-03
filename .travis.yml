@@ -12,3 +12,4 @@ script:
 
 env:
     - PG_VERSION=12
+    - PG_VERSION=13
