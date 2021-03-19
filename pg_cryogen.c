@@ -18,6 +18,7 @@
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
 #include "storage/checksum.h"
+#include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
@@ -61,9 +62,10 @@ typedef struct
 typedef struct CryoModifyState
 {
     Relation    relation;
+    Buffer      target_buffer;
     BlockNumber target_block;
     uint32      tuples_inserted;
-    CacheEntry  cacheEntry; /* cached decompressed page reference */
+    CacheEntry  cacheEntry;         /* cached decompressed page reference */
     char       *data;               /* decompressed data */
 } CryoModifyState;
 
@@ -77,6 +79,7 @@ PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
 static void cryo_preserve(CryoModifyState *state, bool advance);
 static BlockNumber cryo_reserve_blockno(Relation rel);
+static Buffer cryo_allocate_block(Relation rel);
 void _PG_init(void);
 
 static void
@@ -95,7 +98,7 @@ flush_modify_state(void)
 }
 
 static void
-init_modify_state(Relation rel)
+init_modify_state(Relation rel, bool lock_buffer)
 {
     CryoDataHeader *hdr;
 
@@ -113,6 +116,19 @@ init_modify_state(Relation rel)
      * identification for ItemPointers. Read comment in scan_iterator.c for
      * details.
      */
+#if 0
+    if (lock_buffer)
+    {
+        modifyState.target_buffer = cryo_allocate_block(rel);
+        modifyState.target_block = BufferGetBlockNumber(modifyState.target_buffer);
+    }
+    else
+    {
+        modifyState.target_buffer = InvalidBuffer;
+        modifyState.target_block = cryo_reserve_blockno(rel);
+    }
+#endif
+    modifyState.target_buffer = InvalidBuffer;
     modifyState.target_block = cryo_reserve_blockno(rel);
     modifyState.cacheEntry = cryo_cache_allocate(rel, modifyState.target_block);
     modifyState.data = cryo_cache_get_data(modifyState.cacheEntry);
@@ -180,6 +196,21 @@ cryo_slot_callbacks(Relation relation)
 {
 //    return &TTSOpsBufferHeapTuple;
     return &TTSOpsHeapTuple;
+}
+
+static void
+mark_page_nonempty(CryoMetaPage *page, BlockNumber blkno)
+{
+    /*
+     * We subtract 1 because the first block is always dedicated for
+     * meta page.
+     */
+    int byteno = (blkno - 1) / 8;
+    int bit = (blkno - 1) % 8;
+
+    Assert(!(page->page_mask[byteno] & (1 << bit)));
+
+    page->page_mask[byteno] |= (1 << bit);
 }
 
 static TableScanDesc
@@ -266,7 +297,7 @@ read_block:
                              &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
         {
-            if (err == CRYO_ERR_EMPTY_BLOCK)
+            if (err == CRYO_ERR_EMPTY_BLOCK /* || err == CRYO_ERR_WRONG_STARTING_BLOCK */)
             {
                 /* that's ok, just read the next block*/
                 goto read_block;
@@ -562,7 +593,8 @@ cryo_load_meta(Relation rel, int lockmode)
              * (see PageIsNew) and won't pass PageIsVerified check
              */
             metapage->base.pd_upper = BLCKSZ;
-            metapage->base.pd_lower = sizeof(CryoMetaPage);
+            //metapage->base.pd_lower = sizeof(CryoMetaPage);
+            metapage->base.pd_lower = BLCKSZ;
             metapage->base.pd_special = BLCKSZ;
             metapage->version = STORAGE_VERSION;
 
@@ -600,11 +632,121 @@ cryo_reserve_blockno(Relation rel)
     return res;
 }
 
+#if 0
+/*
+ * cryo_allocate_block
+ *      Try to find an empty block or extend relation.
+ */
+static Buffer
+cryo_allocate_block(Relation rel)
+{
+    size_t  sz = BLCKSZ - sizeof(CryoPageHeader);
+    Buffer  buffer;
+
+    /*
+     * First try to find an empty existing block (e.g. from rolled back
+     * transaction)
+     */
+    for (;;)
+    {
+        BlockNumber block;
+        Page        page;
+
+        block = GetPageWithFreeSpace(rel, sz);
+
+        if (!BlockNumberIsValid(block))
+            break;
+
+        /*
+         * After we locked the buffer we have to make sure that it actually has
+         * enough space.
+         */
+        buffer = ReadBuffer(rel, block);
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+        page = BufferGetPage(buffer);
+        if (PageIsNew(page))
+            return buffer;
+
+        UnlockReleaseBuffer(buffer);
+    }
+
+    /*
+     * If there is no empty block, extend the relation.
+     */
+    LockRelationForExtension(rel, ExclusiveLock);
+    buffer = ReadBuffer(rel, P_NEW);
+    LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+    UnlockRelationForExtension(rel, ExclusiveLock);
+
+    return buffer;
+}
+#endif
+
+static void
+cryo_allocate_blocks(Relation rel, CryoMetaPage *metapage, Buffer *buffers, int npages,
+                     BlockNumber skip_block)
+{
+    int byte, bit;
+    int n = BLCKSZ - MAXALIGN(sizeof(CryoMetaPage));
+    int i;
+    int nbuf = 0;
+    unsigned int nblocks = RelationGetNumberOfBlocks(rel);
+    bool more_blocks = true;
+
+    for (byte = 0; byte < n && more_blocks; byte++)
+    {
+        uint8_t mask = metapage->page_mask[byte];
+
+        if (mask == 0xff)
+            /* All bits are set */
+            continue;
+
+        for (bit = 0; bit < 8; bit++)
+        {
+            if (!(mask & (1 << bit)))
+            {
+                BlockNumber blkno = byte * 8 + bit + 1;
+
+                if (blkno >= nblocks)
+                {
+                    more_blocks = false;
+                    break;
+                }
+                /* Ignore already locked buffer */
+                /* TODO: far from perfect */
+                if (blkno == skip_block)
+                    continue;
+
+                /* Bit is unset meaning page is empty */
+                buffers[nbuf] = ReadBuffer(rel, blkno);
+                LockBuffer(buffers[nbuf], BUFFER_LOCK_EXCLUSIVE);
+
+                /* Double check that page is actually empty */
+                if (!PageIsNew(BufferGetPage(buffers[nbuf])))
+                {
+                    LockBuffer(buffers[nbuf], BUFFER_LOCK_UNLOCK);
+                    continue;
+                }
+
+                nbuf++;
+            }
+        }
+    }
+
+    /* No more existing empty pages. Create new ones */
+    while (nbuf < npages)
+    {
+        buffers[nbuf] = ReadBuffer(rel, P_NEW);
+        LockBuffer(buffers[nbuf], BUFFER_LOCK_EXCLUSIVE);
+        nbuf++;
+    }
+}
+
 static inline void
 cryo_multi_insert_internal(Relation rel,
                            TupleTableSlot **slots,
                            int ntuples,
-                           XactCallback callback)
+                           bool lock_buffer)
 {
     CryoDataHeader *hdr;
     int             i;
@@ -612,7 +754,7 @@ cryo_multi_insert_internal(Relation rel,
 
     if (!RelationIsValid(modifyState.relation))
     {
-        init_modify_state(rel);
+        init_modify_state(rel, lock_buffer);
     }
     else if (RelationGetRelid(modifyState.relation) != RelationGetRelid(rel))
     {
@@ -626,7 +768,7 @@ cryo_multi_insert_internal(Relation rel,
          * inserting to, but then there is a risk to exhaust all cache slots.
          */
         flush_modify_state();
-        init_modify_state(rel);
+        init_modify_state(rel, lock_buffer);
     }
     hdr = (CryoDataHeader *) modifyState.data;
 
@@ -645,7 +787,7 @@ cryo_multi_insert_internal(Relation rel,
              * create a new one and retry insertion
              */
             flush_modify_state();
-            init_modify_state(rel);
+            init_modify_state(rel, lock_buffer);
             hdr = (CryoDataHeader *) modifyState.data;
 
             if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
@@ -668,7 +810,7 @@ static void
 cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
                   int options, BulkInsertState bistate)
 {
-    (void) cryo_multi_insert_internal(relation, &slot, 1, cryo_xact_callback);
+    (void) cryo_multi_insert_internal(relation, &slot, 1, false);
 }
 
 static void
@@ -735,27 +877,21 @@ cryo_preserve(CryoModifyState *state, bool advance)
 
     block = MAX(1, block);
 
-    /*
-     * If we need more than one page then lock relation for extension
-     *
-     * XXX don't need to do that for local relations but thats unlikely
-     * the case 
-     */
-    if (npages > 1)
-        LockRelationForExtension(state->relation, ExclusiveLock);
-
     /* allocate and lock bufferes */
-    for (i = 0; i < npages; ++i)
-    {
-        /* the first block was preallocated in init_modify_state */
-        buffers[i] = ReadBuffer(rel, block);
-        LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
-
-        /* but the rest of the blocks must be allocated here */
-        block = P_NEW;
-    }
+    buffers[0] = ReadBuffer(rel, block);
+    LockBuffer(buffers[0], BUFFER_LOCK_EXCLUSIVE);
     if (npages > 1)
+    {
+        /*
+         * If we need more than one page then lock relation for extension
+         *
+         * XXX don't need to do that for local relations but thats unlikely
+         * the case 
+         */
+        LockRelationForExtension(state->relation, ExclusiveLock);
+        cryo_allocate_blocks(state->relation, metapage, buffers + 1, npages - 1, block);
         UnlockRelationForExtension(state->relation, ExclusiveLock);
+    }
 
     /* copy data into buffers and release them*/
     for (i = 0; i < npages; ++i)
@@ -763,6 +899,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
         CryoPageHeader *hdr;
         Size        hdr_size;
         Size        content_size;
+        BlockNumber blkno;
 
         xlog_state = GenericXLogStart(state->relation);
         hdr = (CryoPageHeader *)
@@ -800,6 +937,9 @@ cryo_preserve(CryoModifyState *state, bool advance)
         size -= content_size;
         p += content_size;
 
+        blkno = BufferGetBlockNumber(buffers[i]);
+        RecordPageWithFreeSpace(rel, blkno, PageGetFreeSpace((Page) hdr));
+
         MarkBufferDirty(buffers[i]);
         GenericXLogFinish(xlog_state);
     }
@@ -814,6 +954,9 @@ cryo_preserve(CryoModifyState *state, bool advance)
     state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
     PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
+
+    for (i = 0; i < npages; ++i)
+        mark_page_nonempty(metapage, BufferGetBlockNumber(buffers[i]));
 
     MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
@@ -830,7 +973,7 @@ static void
 cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                   CommandId cid, int options, BulkInsertState bistate)
 {
-    (void) cryo_multi_insert_internal(relation, slots, ntuples, NULL);
+    (void) cryo_multi_insert_internal(relation, slots, ntuples, true);
 }
 
 static void
@@ -1343,11 +1486,15 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         first_page = (CryoFirstPageHeader *) BufferGetPage(buf);
 
+        // Size space = PageGetFreeSpace(BufferGetPage(buf));
+
         /* skip empty pages */
         if (PageIsNew((PageHeader *) first_page))
         {
+            RecordPageWithFreeSpace(onerel, blkno, BLCKSZ - sizeof(CryoPageHeader));
             UnlockReleaseBuffer(buf);
             blkno = cryo_seqscan_iter_next(iter);
+            continue;
         }
 
         vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
@@ -1392,6 +1539,8 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
 
         blkno = cryo_seqscan_iter_next(iter);
     }
+
+    FreeSpaceMapVacuum(onerel);
 }
 
 /*

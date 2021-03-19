@@ -40,7 +40,10 @@ typedef struct
     PageHeaderClone base;           /* to keep PageIsVerified quiet */
     uint16          version;        /* storage version */
     uint64          ntuples;        /* total number of tuples in relation */
+    int8_t          page_mask[0];   /* non-empty pages bitmap */
 } CryoMetaPage;
+
+#define PAGE_MASK_SIZE (BLCKSZ - MAXALIGN(sizeof(PageHeaderClone)))
 
 /*
  * Compressed cryo page maps to several postgres blocks. Each block has
