@@ -278,7 +278,16 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
         cache[item->entry].key = item->key;
         cache[item->entry].pinned = false;
         cache[item->entry].nblocks = 0;
-        err = cryo_read_decompress(rel, iter, blockno, &cache[item->entry]);
+        PG_TRY();
+        {
+            err = cryo_read_decompress(rel, iter, blockno, &cache[item->entry]);
+        }
+        PG_CATCH();
+        {
+            item->entry = InvalidCacheEntry;
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
         if (err != CRYO_ERR_SUCCESS)
         {
             *result = item->entry = InvalidCacheEntry;

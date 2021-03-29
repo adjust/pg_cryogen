@@ -42,6 +42,11 @@ PG_MODULE_MAGIC;
     } while (0)
 
 
+typedef struct
+{
+    dsm_handle dsm_hndl;
+} CryoSharedState;
+
 typedef struct CryoScanDescData
 {
     TableScanDescData   rs_base;
@@ -74,6 +79,10 @@ CryoModifyState modifyState = {
     .relation = NULL
 };
 
+CryoSharedState shared_state;
+
+// static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
@@ -81,6 +90,36 @@ static void cryo_preserve(CryoModifyState *state, bool advance);
 static BlockNumber cryo_reserve_blockno(Relation rel);
 static Buffer cryo_allocate_block(Relation rel);
 void _PG_init(void);
+
+#if 0
+void
+_PG_init(void)
+{
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = cryo_shmem_startup;
+}
+
+static void
+cryo_shmem_startup(void)
+{
+    bool found;
+
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+    pgss = ShmemInitStruct("pg_stat_statements",
+                           sizeof(pgssSharedState),
+                           &found);
+
+    if (!found)
+    {
+        shared_state.dsm_hndl = init_free_space_cache();
+    }
+	LWLockRelease(AddinShmemInitLock);
+}
+#endif
 
 static void
 flush_modify_state(void)
@@ -297,7 +336,7 @@ read_block:
                              &scan->cacheEntry);
         if (err != CRYO_ERR_SUCCESS)
         {
-            if (err == CRYO_ERR_EMPTY_BLOCK /* || err == CRYO_ERR_WRONG_STARTING_BLOCK */)
+            if (err == CRYO_ERR_EMPTY_BLOCK || err == CRYO_ERR_WRONG_STARTING_BLOCK )
             {
                 /* that's ok, just read the next block*/
                 goto read_block;
@@ -593,8 +632,8 @@ cryo_load_meta(Relation rel, int lockmode)
              * (see PageIsNew) and won't pass PageIsVerified check
              */
             metapage->base.pd_upper = BLCKSZ;
-            //metapage->base.pd_lower = sizeof(CryoMetaPage);
-            metapage->base.pd_lower = BLCKSZ;
+            metapage->base.pd_lower = sizeof(CryoMetaPage);
+            // metapage->base.pd_lower = BLCKSZ;
             metapage->base.pd_special = BLCKSZ;
             metapage->version = STORAGE_VERSION;
 
@@ -862,19 +901,21 @@ cryo_preserve(CryoModifyState *state, bool advance)
     int         npages;
     Buffer      metabuf;
     Buffer     *buffers;
+    // Buffer      buf;
     int         i;
-    BlockNumber block;
+    BlockNumber block, first_block;
 
     p = compressed = cryo_compress(method, state->data, &size);
 
-    metabuf = cryo_load_meta(state->relation, BUFFER_LOCK_EXCLUSIVE);
+    metabuf = cryo_load_meta(rel, BUFFER_LOCK_EXCLUSIVE);
     metapage = (CryoMetaPage *) BufferGetPage(metabuf);
-    block = state->target_block;
+    first_block = block = state->target_block;
 
     /* split data into pages */
     npages = cryo_pages_needed(size);
     buffers = palloc(npages * sizeof(Buffer));
 
+#if 0
     block = MAX(1, block);
 
     /* allocate and lock bufferes */
@@ -892,6 +933,28 @@ cryo_preserve(CryoModifyState *state, bool advance)
         cryo_allocate_blocks(state->relation, metapage, buffers + 1, npages - 1, block);
         UnlockRelationForExtension(state->relation, ExclusiveLock);
     }
+#endif
+    buffers[0] = ReadBuffer(rel, block);
+    LockBuffer(buffers[0], BUFFER_LOCK_EXCLUSIVE);
+    for (i = 1; i < npages; ++i)
+    {
+        Size space_needed = BLCKSZ - sizeof(CryoPageHeader);
+
+        block = RecordAndGetPageWithFreeSpace(rel, block, 0, space_needed);
+        if (BlockNumberIsValid(block))
+        {
+            buffers[i] = ReadBuffer(rel, block);
+        }
+        else
+        {
+            LockRelationForExtension(rel, ExclusiveLock);
+            buffers[i] = ReadBuffer(rel, P_NEW);
+            block = BufferGetBlockNumber(buffers[i]);
+            UnlockRelationForExtension(rel, ExclusiveLock);
+        }
+        LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
+    }
+    RecordPageWithFreeSpace(rel, block, 0);
 
     /* copy data into buffers and release them*/
     for (i = 0; i < npages; ++i)
@@ -899,13 +962,16 @@ cryo_preserve(CryoModifyState *state, bool advance)
         CryoPageHeader *hdr;
         Size        hdr_size;
         Size        content_size;
-        BlockNumber blkno;
+        // BlockNumber blkno;
 
-        xlog_state = GenericXLogStart(state->relation);
+        xlog_state = GenericXLogStart(rel);
         hdr = (CryoPageHeader *)
-            GenericXLogRegisterBuffer(xlog_state, buffers[i],
-                                      GENERIC_XLOG_FULL_IMAGE);
-        hdr->first = BufferGetBlockNumber(buffers[0]);
+            GenericXLogRegisterBuffer(xlog_state, buffers[i], GENERIC_XLOG_FULL_IMAGE);
+
+        if (!PageIsNew((Page) hdr))
+            elog(ERROR, "pg_cryogen: page is not new (block number %i)", block);
+
+        hdr->first = first_block;
         hdr->next = (i + 1 < npages) ? BufferGetBlockNumber(buffers[i + 1]) : InvalidBlockNumber;
 
         /* write additional info into the first page */
@@ -937,15 +1003,15 @@ cryo_preserve(CryoModifyState *state, bool advance)
         size -= content_size;
         p += content_size;
 
-        blkno = BufferGetBlockNumber(buffers[i]);
-        RecordPageWithFreeSpace(rel, blkno, PageGetFreeSpace((Page) hdr));
+        // blkno = BufferGetBlockNumber(buffers[i]);
+        // RecordPageWithFreeSpace(rel, blkno, PageGetFreeSpace((Page) hdr));
 
         MarkBufferDirty(buffers[i]);
         GenericXLogFinish(xlog_state);
     }
 
     /* update metadata */
-    xlog_state = GenericXLogStart(state->relation);
+    xlog_state = GenericXLogStart(rel);
     metapage = (CryoMetaPage *)
         GenericXLogRegisterBuffer(xlog_state, metabuf,
                                   GENERIC_XLOG_FULL_IMAGE);
@@ -955,8 +1021,10 @@ cryo_preserve(CryoModifyState *state, bool advance)
     metapage->ntuples += state->tuples_inserted;
     PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
 
+#if 0
     for (i = 0; i < npages; ++i)
         mark_page_nonempty(metapage, BufferGetBlockNumber(buffers[i]));
+#endif
 
     MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
@@ -1481,10 +1549,15 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         Buffer      buf;
         Buffer      vmbuf = InvalidBuffer;
         uint8       vmflags;
+        bool        commited;
+        int         nblocks;
+        int         i;
 
         buf = ReadBuffer(onerel, blkno);
-        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        // LockBuffer(buf, BUFFER_LOCK_SHARE);
+        LockBufferForCleanup(buf);
         first_page = (CryoFirstPageHeader *) BufferGetPage(buf);
+        page = (CryoPageHeader *) first_page;
 
         // Size space = PageGetFreeSpace(BufferGetPage(buf));
 
@@ -1496,6 +1569,23 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             blkno = cryo_seqscan_iter_next(iter);
             continue;
         }
+
+        if (page->first != blkno)
+        {
+            /*
+             * This is not the first page of the cryo block. Skip it for now,
+             * we'll get back to it later.
+             */
+            UnlockReleaseBuffer(buf);
+            blkno = cryo_seqscan_iter_next(iter);
+            continue;
+        }
+
+        /*
+         * If transaction did not commit we consider the corresponding pages
+         * empty.
+         */
+        commited = TransactionIdDidCommit(first_page->created_xid);
 
         vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
         if (!(vmflags & VISIBILITYMAP_ALL_FROZEN))
@@ -1516,26 +1606,50 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             }
         }
 
+        if (!commited)
+            RecordPageWithFreeSpace(onerel, blkno, BLCKSZ - sizeof(CryoPageHeader));
+
+        nblocks = first_page->npages;
+        Buffer *buffers = palloc0(sizeof(Buffer) * nblocks);
+
         /*
          * Mark the rest pages as read. Not optimal way to do it, but the only
          * solution I came up with so far.
          */
-        page = (CryoPageHeader *) first_page;
-        while (BlockNumberIsValid(page->next))
+        buffers[0] = buf;
+        for (i = 1; i < nblocks; ++i)
         {
-            Buffer  b;
+            if (!BlockNumberIsValid(page->next))
+                elog(ERROR, "unexpected page chain end");
 
-            blkno = page->next;
-            b = ReadBuffer(onerel, blkno);
-            LockBuffer(b, BUFFER_LOCK_SHARE);
-            page = (CryoPageHeader *) BufferGetPage(b);
-            cryo_seqscan_iter_exclude(iter, blkno, false);
-            UnlockReleaseBuffer(b);
+            buffers[i] = ReadBuffer(onerel, page->next);
+            LockBufferForCleanup(buffers[i]);
+            page = (CryoPageHeader *) BufferGetPage(buffers[i]);
         }
+
+        for (i = 0; i < nblocks; ++i)
+        {
+            if (!commited)
+            {
+                GenericXLogState *xlogState = GenericXLogStart(onerel);
+
+                page = (CryoPageHeader *)
+                    GenericXLogRegisterBuffer(xlogState, buffers[i], GENERIC_XLOG_FULL_IMAGE);
+                memset(page, 0, BLCKSZ);
+                GenericXLogFinish(xlogState);
+                RecordPageWithFreeSpace(onerel, BufferGetBlockNumber(buffers[i]),
+                                        BLCKSZ - sizeof(CryoPageHeader));
+            }
+
+            if (i != 0)
+                cryo_seqscan_iter_exclude(iter, BufferGetBlockNumber(buffers[i]), false);
+
+            UnlockReleaseBuffer(buffers[i]);
+        }
+        pfree(buffers);
 
         if (BufferIsValid(vmbuf))
             ReleaseBuffer(vmbuf);
-        UnlockReleaseBuffer(buf);
 
         blkno = cryo_seqscan_iter_next(iter);
     }
