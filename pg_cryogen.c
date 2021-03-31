@@ -968,7 +968,8 @@ cryo_preserve(CryoModifyState *state, bool advance)
         hdr = (CryoPageHeader *)
             GenericXLogRegisterBuffer(xlog_state, buffers[i], GENERIC_XLOG_FULL_IMAGE);
 
-        if (!PageIsNew((Page) hdr))
+        // if (!PageIsNew((Page) hdr))
+        if (hdr->first != 0 || hdr->next != 0)
             elog(ERROR, "pg_cryogen: page is not new (block number %i)", block);
 
         hdr->first = first_block;
@@ -1554,12 +1555,9 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         int         i;
 
         buf = ReadBuffer(onerel, blkno);
-        // LockBuffer(buf, BUFFER_LOCK_SHARE);
         LockBufferForCleanup(buf);
         first_page = (CryoFirstPageHeader *) BufferGetPage(buf);
         page = (CryoPageHeader *) first_page;
-
-        // Size space = PageGetFreeSpace(BufferGetPage(buf));
 
         /* skip empty pages */
         if (PageIsNew((PageHeader *) first_page))
@@ -1575,6 +1573,8 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             /*
              * This is not the first page of the cryo block. Skip it for now,
              * we'll get back to it later.
+             * This is also the case when a page created by non commited
+             * transaction was previously vacuumed (i.e. first == next == 0).
              */
             UnlockReleaseBuffer(buf);
             blkno = cryo_seqscan_iter_next(iter);
@@ -1633,10 +1633,27 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             {
                 GenericXLogState *xlogState = GenericXLogStart(onerel);
 
+                blkno = BufferGetBlockNumber(buffers[i]);
+
+                page = (CryoPageHeader *)
+                    GenericXLogRegisterBuffer(xlogState, buffers[i], GENERIC_XLOG_FULL_IMAGE);
+                page->first = page->next = 0;
+                page->base.pd_upper = BLCKSZ;
+                page->base.pd_lower = sizeof(CryoMetaPage);
+                page->base.pd_special = BLCKSZ;
+                PageSetChecksumInplace((Page) page, blkno);
+                GenericXLogFinish(xlogState);                
+
+#if 0
+                GenericXLogState *xlogState = GenericXLogStart(onerel);
+
                 page = (CryoPageHeader *)
                     GenericXLogRegisterBuffer(xlogState, buffers[i], GENERIC_XLOG_FULL_IMAGE);
                 memset(page, 0, BLCKSZ);
+                PageSetChecksumInplace((Page) page, block);
                 GenericXLogFinish(xlogState);
+#endif
+
                 RecordPageWithFreeSpace(onerel, BufferGetBlockNumber(buffers[i]),
                                         BLCKSZ - sizeof(CryoPageHeader));
             }

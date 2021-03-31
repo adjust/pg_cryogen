@@ -31,6 +31,13 @@ typedef struct
     CacheEntry  entry;
 } PageIdCacheEntry;
 
+typedef union
+{
+    BlockNumber starting_blockno;
+}
+CryoErrData;
+
+
 /* Timestamp */
 typedef unsigned long long TS;
 
@@ -99,7 +106,7 @@ get_current_timestamp_ms(void)
  */
 static CryoError
 cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
-                     CacheEntryHeader *entry)
+                     CacheEntryHeader *entry, CryoErrData *errdata)
 {
     CryoPageHeader     *page;
     CompressionMethod   method;
@@ -125,6 +132,7 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
      */
     if (page->first != block)
     {
+        errdata->starting_blockno = page->first;
         ReleaseBuffer(buf);
         return CRYO_ERR_WRONG_STARTING_BLOCK;
     }
@@ -171,7 +179,8 @@ cryo_read_decompress(Relation rel, SeqScanIterator *iter, BlockNumber block,
 
         Assert(page->first == first_block);
 
-        cryo_seqscan_iter_exclude(iter, block, false);
+        // cryo_seqscan_iter_exclude(iter, block, false);
+        cryo_seqscan_iter_exclude(iter, block, true);
         entry->blocks[entry->nblocks++] = block;
     }
 
@@ -250,10 +259,12 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
         .relid = RelationGetRelid(rel),
         .blockno = blockno
     };
-    PageIdCacheEntry *item;
+    PageIdCacheEntry   *item;
+    CryoErrData         errdata;
 
+read_block:
      /* TODO: do not rely on RelationGetNumberOfBlocks; refer to metapage */
-    if (RelationGetNumberOfBlocks(rel) <= blockno || blockno == CRYO_META_PAGE)
+    if (RelationGetNumberOfBlocks(rel) <= pageId.blockno || pageId.blockno == CRYO_META_PAGE)
     {
         *result = InvalidCacheEntry;
         return CRYO_ERR_WRONG_STARTING_BLOCK;
@@ -280,7 +291,7 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
         cache[item->entry].nblocks = 0;
         PG_TRY();
         {
-            err = cryo_read_decompress(rel, iter, blockno, &cache[item->entry]);
+            err = cryo_read_decompress(rel, iter, pageId.blockno, &cache[item->entry], &errdata);
         }
         PG_CATCH();
         {
@@ -288,10 +299,20 @@ cryo_read_data(Relation rel, SeqScanIterator *iter, BlockNumber blockno,
             PG_RE_THROW();
         }
         PG_END_TRY();
-        if (err != CRYO_ERR_SUCCESS)
+
+        switch (err)
         {
-            *result = item->entry = InvalidCacheEntry;
-            return err;
+            case CRYO_ERR_SUCCESS:
+                break;
+
+            case CRYO_ERR_WRONG_STARTING_BLOCK:
+                pageId.blockno = errdata.starting_blockno;
+                item->entry = InvalidCacheEntry;
+                goto read_block; 
+
+            default:
+                *result = item->entry = InvalidCacheEntry;
+                return err;
         }
     }
     else
