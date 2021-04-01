@@ -40,6 +40,8 @@ PG_MODULE_MAGIC;
     do { \
         elog(ERROR, "function \"%s\" is not implemented", __func__); \
     } while (0)
+#define PageIsEmpty(page) \
+    (((CryoPageHeader *) page)->first == 0 && ((CryoPageHeader *) page)->next == 0)
 
 
 typedef struct
@@ -82,14 +84,18 @@ CryoModifyState modifyState = {
 CryoSharedState shared_state;
 
 // static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+ExecutorFinish_hook_type ExecutorFinish_hook_prev = NULL;
 
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
 static void cryo_preserve(CryoModifyState *state, bool advance);
-static BlockNumber cryo_reserve_blockno(Relation rel);
+// static BlockNumber cryo_reserve_blockno(Relation rel);
+static Buffer cryo_reserve_blockno(Relation rel);
 static Buffer cryo_allocate_block(Relation rel);
+static void cryo_executor_finish_hook(QueryDesc *queryDesc);
 void _PG_init(void);
+
 
 #if 0
 void
@@ -137,7 +143,7 @@ flush_modify_state(void)
 }
 
 static void
-init_modify_state(Relation rel, bool lock_buffer)
+init_modify_state(Relation rel)
 {
     CryoDataHeader *hdr;
 
@@ -155,20 +161,8 @@ init_modify_state(Relation rel, bool lock_buffer)
      * identification for ItemPointers. Read comment in scan_iterator.c for
      * details.
      */
-#if 0
-    if (lock_buffer)
-    {
-        modifyState.target_buffer = cryo_allocate_block(rel);
-        modifyState.target_block = BufferGetBlockNumber(modifyState.target_buffer);
-    }
-    else
-    {
-        modifyState.target_buffer = InvalidBuffer;
-        modifyState.target_block = cryo_reserve_blockno(rel);
-    }
-#endif
-    modifyState.target_buffer = InvalidBuffer;
-    modifyState.target_block = cryo_reserve_blockno(rel);
+    modifyState.target_buffer = cryo_allocate_block(rel);
+    modifyState.target_block = BufferGetBlockNumber(modifyState.target_buffer);
     modifyState.cacheEntry = cryo_cache_allocate(rel, modifyState.target_block);
     modifyState.data = cryo_cache_get_data(modifyState.cacheEntry);
     hdr = (CryoDataHeader *) modifyState.data;
@@ -196,8 +190,18 @@ init_modify_state(Relation rel, bool lock_buffer)
 }
 
 static void
+cryo_executor_finish_hook(QueryDesc *queryDesc)
+{
+    elog(NOTICE, "cryo_executor_finish_hook");
+    ExecutorFinish_hook_prev(queryDesc);
+
+    (void) flush_modify_state();
+}
+
+static void
 cryo_xact_callback(XactEvent event, void *arg)
 {
+#if 0
     switch (event)
     {
         case XACT_EVENT_PRE_COMMIT:
@@ -213,6 +217,13 @@ cryo_xact_callback(XactEvent event, void *arg)
             /* do nothing */
             ;
     }
+#endif
+
+    if (event == XACT_EVENT_ABORT)
+    {
+        modifyState.relation = NULL;
+        modifyState.tuples_inserted = 0;
+    }
 }
 
 static void
@@ -224,6 +235,9 @@ cryo_relcache_callback(Datum arg, Oid relid)
 void
 _PG_init(void)
 {
+    ExecutorFinish_hook_prev = ExecutorFinish_hook;
+    ExecutorFinish_hook = cryo_executor_finish_hook;
+
     cryo_init_cache();
     cryo_define_compression_gucs();
     RegisterXactCallback(cryo_xact_callback, NULL);
@@ -656,22 +670,6 @@ cryo_load_meta(Relation rel, int lockmode)
     return metabuf;
 }
 
-static BlockNumber
-cryo_reserve_blockno(Relation rel)
-{
-    Buffer      buf;
-    BlockNumber res;
-
-    LockRelationForExtension(rel, ExclusiveLock);
-    buf = ReadBuffer(rel, P_NEW);
-    UnlockRelationForExtension(rel, ExclusiveLock);
-    res = BufferGetBlockNumber(buf);
-    ReleaseBuffer(buf);
-
-    return res;
-}
-
-#if 0
 /*
  * cryo_allocate_block
  *      Try to find an empty block or extend relation.
@@ -681,17 +679,16 @@ cryo_allocate_block(Relation rel)
 {
     size_t  sz = BLCKSZ - sizeof(CryoPageHeader);
     Buffer  buffer;
+    BlockNumber block;
 
     /*
      * First try to find an empty existing block (e.g. from rolled back
      * transaction)
      */
+    block = GetPageWithFreeSpace(rel, sz);
     for (;;)
     {
-        BlockNumber block;
         Page        page;
-
-        block = GetPageWithFreeSpace(rel, sz);
 
         if (!BlockNumberIsValid(block))
             break;
@@ -703,9 +700,13 @@ cryo_allocate_block(Relation rel)
         buffer = ReadBuffer(rel, block);
         LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
         page = BufferGetPage(buffer);
-        if (PageIsNew(page))
+        if (PageIsEmpty(page))
+        {
+            RecordPageWithFreeSpace(rel, block, 0);
             return buffer;
+        }
 
+        block = RecordAndGetPageWithFreeSpace(rel, block, 0, sz);
         UnlockReleaseBuffer(buffer);
     }
 
@@ -719,7 +720,6 @@ cryo_allocate_block(Relation rel)
 
     return buffer;
 }
-#endif
 
 static void
 cryo_allocate_blocks(Relation rel, CryoMetaPage *metapage, Buffer *buffers, int npages,
@@ -784,8 +784,7 @@ cryo_allocate_blocks(Relation rel, CryoMetaPage *metapage, Buffer *buffers, int 
 static inline void
 cryo_multi_insert_internal(Relation rel,
                            TupleTableSlot **slots,
-                           int ntuples,
-                           bool lock_buffer)
+                           int ntuples)
 {
     CryoDataHeader *hdr;
     int             i;
@@ -793,7 +792,7 @@ cryo_multi_insert_internal(Relation rel,
 
     if (!RelationIsValid(modifyState.relation))
     {
-        init_modify_state(rel, lock_buffer);
+        init_modify_state(rel);
     }
     else if (RelationGetRelid(modifyState.relation) != RelationGetRelid(rel))
     {
@@ -807,7 +806,7 @@ cryo_multi_insert_internal(Relation rel,
          * inserting to, but then there is a risk to exhaust all cache slots.
          */
         flush_modify_state();
-        init_modify_state(rel, lock_buffer);
+        init_modify_state(rel);
     }
     hdr = (CryoDataHeader *) modifyState.data;
 
@@ -826,7 +825,7 @@ cryo_multi_insert_internal(Relation rel,
              * create a new one and retry insertion
              */
             flush_modify_state();
-            init_modify_state(rel, lock_buffer);
+            init_modify_state(rel);
             hdr = (CryoDataHeader *) modifyState.data;
 
             if ((pos = cryo_storage_insert(hdr, tuple)) < 0)
@@ -849,7 +848,7 @@ static void
 cryo_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
                   int options, BulkInsertState bistate)
 {
-    (void) cryo_multi_insert_internal(relation, &slot, 1, false);
+    (void) cryo_multi_insert_internal(relation, &slot, 1);
 }
 
 static void
@@ -934,8 +933,7 @@ cryo_preserve(CryoModifyState *state, bool advance)
         UnlockRelationForExtension(state->relation, ExclusiveLock);
     }
 #endif
-    buffers[0] = ReadBuffer(rel, block);
-    LockBuffer(buffers[0], BUFFER_LOCK_EXCLUSIVE);
+    buffers[0] = state->target_buffer;
     for (i = 1; i < npages; ++i)
     {
         Size space_needed = BLCKSZ - sizeof(CryoPageHeader);
@@ -1042,7 +1040,7 @@ static void
 cryo_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
                   CommandId cid, int options, BulkInsertState bistate)
 {
-    (void) cryo_multi_insert_internal(relation, slots, ntuples, true);
+    (void) cryo_multi_insert_internal(relation, slots, ntuples);
 }
 
 static void
@@ -1376,7 +1374,7 @@ cryo_index_build_range_scan(Relation rel,
         snapshot = scan->rs_snapshot;
     }
 
-    /* Publish number of blocks to scan */
+    /* Publish the number of blocks to scan */
     if (progress)
     {
         /* TODO */
