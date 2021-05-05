@@ -5,7 +5,7 @@ PGFILEDESC = "pg_cryogen - append-only compressed storage"
 SHLIB_LINK = -llz4 -lzstd
 
 EXTENSION = pg_cryogen
-DATA = pg_cryogen--0.1.sql
+DATA = pg_cryogen--0.1.sql pg_cryogen--0.1--0.2.sql
 
 REGRESS = pg_cryogen
 

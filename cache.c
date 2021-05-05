@@ -387,6 +387,21 @@ cryo_cache_invalidate_relation(Oid relid)
     }
 }
 
+void
+cryo_cache_invalidate_relblock(Oid relid, BlockNumber blockno)
+{
+    int     i;
+
+    for (i = 0; i < CACHE_SIZE; ++i)
+    {
+        if (cache[i].key.relid == relid && cache[i].key.blockno == blockno)
+        {
+            hash_search(pagemap, &cache[i].key, HASH_REMOVE, NULL);
+            cache[i].ts = 0;
+        }
+    }
+}
+
 uint32
 cryo_cache_get_pg_nblocks(CacheEntry entry)
 {

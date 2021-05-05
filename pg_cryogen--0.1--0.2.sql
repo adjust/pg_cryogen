@@ -1,0 +1,4 @@
+CREATE OR REPLACE FUNCTION cryo_purge(rel REGCLASS, attname CSTRING, val ANYELEMENT)
+RETURNS VOID
+AS '$libdir/pg_cryogen.so'
+LANGUAGE C STRICT;
