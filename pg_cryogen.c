@@ -1897,8 +1897,6 @@ index_extract_tids(Relation irel, Datum val, Oid valtype,
             if (res2->blockno == res1->blockno)
                 border_blocks = lappend_int(border_blocks, res2->blockno);
 
-            // while ((res2 = tbm_iterate(it2)) != NULL && res2->blockno < res1->blockno)
-            //     ;
             res1 = tbm_iterate(it1);
         }
 
@@ -1921,7 +1919,6 @@ index_extract_tids(Relation irel, Datum val, Oid valtype,
         {
             (*blocks)[i++] = lfirst_int(lc);
         }
-        // pg_qsort(*blocks, *nblocks, sizeof(BlockNumber), BlockNumberComparator);
     }
 
     return tbm_le;
@@ -1990,8 +1987,7 @@ vac_record_tuple(LVDeadTuples *tuples, BlockNumber blockno, OffsetNumber offset)
      */
     if (tuples->num_tuples < tuples->max_tuples)
     {
-        BlockIdSet(&tuples->itemptrs[tuples->num_tuples].ip_blkid, blockno);
-        tuples->itemptrs[tuples->num_tuples].ip_posid = offset;
+        ItemPointerSet(&tuples->itemptrs[tuples->num_tuples], blockno, offset);
         tuples->num_tuples++;
         // pgstat_progress_update_param(PROGRESS_VACUUM_NUM_DEAD_TUPLES,
         //                              tuples->num_tuples);
@@ -2179,7 +2175,6 @@ cryo_purge(PG_FUNCTION_ARGS)
             index_close(irel, RowExclusiveLock);
             continue;
         }
-        // indexlist = lappend(indexlist, irel);
         irels[nindexes++] = irel;
 
         Assert(index->indnatts > 0);
@@ -2213,25 +2208,26 @@ cryo_purge(PG_FUNCTION_ARGS)
         {
             BlockNumber *blockno_ptr;
 
-            blockno_ptr = bsearch((void *) &tbmres->blockno,
-                                  (void *) border_blocks,
-                                  nborder_blocks,
-                                  sizeof(BlockNumber),
-                                  cryo_cmp_blockno);
+            if (border_blocks)
+            {
+                blockno_ptr = bsearch((void *) &tbmres->blockno,
+                                      (void *) border_blocks,
+                                      nborder_blocks,
+                                      sizeof(BlockNumber),
+                                      cryo_cmp_blockno);
 
-            /* If current block is one of border blocks - skip it */
-            if (blockno_ptr)
-                continue;
+                /* If current block is one of border blocks - skip it */
+                if (blockno_ptr)
+                    continue;
+            }
 
             /* Did tuples struct reach max capacity? */
             if ((tuples->max_tuples - tuples->num_tuples) < MaxHeapTuplesPerPage &&
                 tuples->num_tuples > 0)
             {
                 /* TODO: update index stats */
-#ifndef DEBUG_TBM
                 cryo_vacuum_indexes(irels, indstats, nindexes, tuples);
                 cryo_drop_blocks(rel, dead_blocks);
-#endif
                 elog(NOTICE, "index_bulk_delete() and drop pages");
                 list_free(dead_blocks);
                 dead_blocks = NIL;
@@ -2243,7 +2239,18 @@ cryo_purge(PG_FUNCTION_ARGS)
              */
             if (tbmres->ntuples == -1)
             {
-                elog(ERROR, "not implemented yet");
+                CacheEntry  cacheEntry;
+                CryoError   err;
+                CryoDataHeader *hdr;
+                int         item = 1;
+
+                err = cryo_read_data(rel, NULL, tbmres->blockno, &cacheEntry);
+                hdr = (CryoDataHeader *) cryo_cache_get_data(cacheEntry);
+
+                while (item * sizeof(CryoItemId) < hdr->lower)
+                {
+                    vac_record_tuple(tuples, tbmres->blockno, item++);
+                }
             }
             else
             {
@@ -2254,11 +2261,10 @@ cryo_purge(PG_FUNCTION_ARGS)
             }
             dead_blocks = lappend_int(dead_blocks, tbmres->blockno);
         }
+
         /* TODO: update index stats */
-#ifndef DEBUG_TBM
         cryo_vacuum_indexes(irels, indstats, nindexes, tuples);
         cryo_drop_blocks(rel, dead_blocks);
-#endif
         elog(NOTICE, "final index_bulk_delete() and drop pages");
 
         tbm_end_iterate(iter);
