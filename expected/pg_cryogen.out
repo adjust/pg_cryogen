@@ -163,4 +163,8 @@ SELECT ('
 }')::jsonb
 FROM generate_series(1, 300) as gs;
 SELECT count(*) FROM json_data;
-ERROR:  pg_cryogen: iternal error; block 3 is not the part of seqscan iterator
+ count 
+-------
+   300
+(1 row)
+
