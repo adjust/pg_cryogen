@@ -18,6 +18,6 @@ jobs:
 
     steps:
       - run: pg-setup ${{ matrix.pg }}
-      - run: apt-get install liblz4-dev libzstd-dev
+      - run: apt-get install -y liblz4-dev libzstd-dev
       - uses: actions/checkout@v2
       - run: build-check
