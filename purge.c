@@ -208,7 +208,7 @@ tidlist_alloc(BlockNumber relblocks)
 }
 
 static void
-vac_record_tuple(TIDList *tuples, BlockNumber blockno, OffsetNumber offset)
+tidlist_record_item(TIDList *tuples, BlockNumber blockno, OffsetNumber offset)
 {
     /*
      * The array shouldn't overflow under normal behavior, but perhaps it
@@ -225,7 +225,7 @@ vac_record_tuple(TIDList *tuples, BlockNumber blockno, OffsetNumber offset)
 }
 
 static int
-cryo_cmp_itemptr(const void *left, const void *right)
+cmp_itemptr(const void *left, const void *right)
 {
 	BlockNumber lblk,
 				rblk;
@@ -268,7 +268,7 @@ tid_reaped(ItemPointer itemptr, void *state)
 								(void *) tuples->itemptrs,
 								tuples->num_tuples,
 								sizeof(ItemPointerData),
-								cryo_cmp_itemptr);
+								cmp_itemptr);
 
 	return (res != NULL);
 }
@@ -350,6 +350,7 @@ drop_blocks(Relation rel, List *blocks)
         }
         pfree(buffers);
     }
+    FreeSpaceMapVacuum(rel);
 }
 
 /*
@@ -463,7 +464,7 @@ cryo_purge(PG_FUNCTION_ARGS)
 
             /*
              * Got lossy result meaning we didn't get item pointers within
-             * tidbitmap and have to read them directly from cryo page.
+             * tidbitmap and have to read them directly from the cryo page.
              */
             if (tbmres->ntuples == -1)
             {
@@ -477,14 +478,14 @@ cryo_purge(PG_FUNCTION_ARGS)
 
                 while (item * sizeof(CryoItemId) < hdr->lower)
                 {
-                    vac_record_tuple(tuples, tbmres->blockno, item++);
+                    tidlist_record_item(tuples, tbmres->blockno, item++);
                 }
             }
             else
             {
                 for (int i = 0; i < tbmres->ntuples; ++i)
                 {
-                    vac_record_tuple(tuples, tbmres->blockno, tbmres->offsets[i]);
+                    tidlist_record_item(tuples, tbmres->blockno, tbmres->offsets[i]);
                 }
             }
             dead_blocks = lappend_int(dead_blocks, tbmres->blockno);
