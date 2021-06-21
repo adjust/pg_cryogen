@@ -13,11 +13,13 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/vacuum.h"
+#include "commands/progress.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/checksum.h"
 #include "storage/freespace.h"
@@ -78,16 +80,12 @@ CryoModifyState modifyState = {
     .relation = NULL
 };
 
-// CryoSharedState shared_state;
-
-// static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 ExecutorFinish_hook_type ExecutorFinish_hook_prev = NULL;
 
 
 PG_FUNCTION_INFO_V1(cryo_tableam_handler);
 static Buffer cryo_load_meta(Relation rel, int lockmode);
 static void cryo_preserve(CryoModifyState *state, bool advance);
-// static BlockNumber cryo_reserve_blockno(Relation rel);
 static Buffer cryo_reserve_blockno(Relation rel);
 static Buffer cryo_allocate_block(Relation rel);
 static void cryo_executor_finish_hook(QueryDesc *queryDesc);
@@ -202,21 +200,6 @@ cryo_slot_callbacks(Relation relation)
     return &TTSOpsHeapTuple;
 }
 
-static void
-mark_page_nonempty(CryoMetaPage *page, BlockNumber blkno)
-{
-    /*
-     * We subtract 1 because the first block is always dedicated for
-     * meta page.
-     */
-    int byteno = (blkno - 1) / 8;
-    int bit = (blkno - 1) % 8;
-
-    Assert(!(page->page_mask[byteno] & (1 << bit)));
-
-    page->page_mask[byteno] |= (1 << bit);
-}
-
 static TableScanDesc
 cryo_beginscan(Relation relation, Snapshot snapshot,
                int nkeys, ScanKey key,
@@ -238,7 +221,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     scan->rs_base.rs_flags = flags;
     scan->cur_item = 0;
     scan->cur_block = 0;
-    scan->nblocks = 0;
+    scan->nblocks = RelationGetNumberOfBlocks(relation);
     scan->cacheEntry = InvalidCacheEntry; 
     scan->iterator = cryo_seqscan_iter_create();
 
@@ -290,11 +273,7 @@ read_block:
     {
         scan->cur_block = cryo_seqscan_iter_next(scan->iterator);
 
-        /*
-         * TODO: probably read the number of block just once and store in the
-         * scan state
-         */
-        if (RelationGetNumberOfBlocks(rel) <= scan->cur_block)
+        if (scan->cur_block >= scan->nblocks)
             return false;
 
         err = cryo_read_data(rel, scan->iterator, scan->cur_block,
@@ -311,7 +290,6 @@ read_block:
                      errmsg("pg_cryogen: %s", cryo_cache_err(err)),
                      errhint("block number: %u", scan->cur_block)));
         }
-        scan->nblocks = cryo_cache_get_pg_nblocks(scan->cacheEntry);
         scan->cur_item = 1;
 
         if (!xid_is_visible(sscan->rs_snapshot, cryo_cache_get_xid(scan->cacheEntry)))
@@ -474,8 +452,7 @@ cryo_scan_bitmap_next_block(TableScanDesc scan,
             elog(ERROR, "pg_cryogen: %s", cryo_cache_err(err));
     }
 
-    cscan->nblocks = cryo_cache_get_pg_nblocks(cscan->cacheEntry);
-    if (cscan->nblocks == 0)
+    if (cryo_cache_get_pg_nblocks(cscan->cacheEntry) == 0)
         return false;
     cscan->cur_block = blockno;
 
@@ -598,7 +575,6 @@ cryo_load_meta(Relation rel, int lockmode)
              */
             metapage->base.pd_upper = BLCKSZ;
             metapage->base.pd_lower = sizeof(CryoMetaPage);
-            // metapage->base.pd_lower = BLCKSZ;
             metapage->base.pd_special = BLCKSZ;
             metapage->version = STORAGE_VERSION;
 
@@ -791,7 +767,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
     int         npages;
     Buffer      metabuf;
     Buffer     *buffers;
-    // Buffer      buf;
     int         i;
     BlockNumber block, first_block;
 
@@ -832,7 +807,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
         CryoPageHeader *hdr;
         Size        hdr_size;
         Size        content_size;
-        // BlockNumber blkno;
 
         xlog_state = GenericXLogStart(rel);
         hdr = (CryoPageHeader *)
@@ -873,9 +847,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
         size -= content_size;
         p += content_size;
 
-        // blkno = BufferGetBlockNumber(buffers[i]);
-        // RecordPageWithFreeSpace(rel, blkno, PageGetFreeSpace((Page) hdr));
-
         MarkBufferDirty(buffers[i]);
         GenericXLogFinish(xlog_state);
     }
@@ -890,11 +861,6 @@ cryo_preserve(CryoModifyState *state, bool advance)
     state->target_block = block;
     metapage->ntuples += state->tuples_inserted;
     PageSetChecksumInplace((Page) metapage, CRYO_META_PAGE);
-
-#if 0
-    for (i = 0; i < npages; ++i)
-        mark_page_nonempty(metapage, BufferGetBlockNumber(buffers[i]));
-#endif
 
     MarkBufferDirty(metabuf);
     GenericXLogFinish(xlog_state);
@@ -1176,6 +1142,9 @@ cryo_index_build_range_scan(Relation rel,
     ExprContext *econtext;
     Snapshot    snapshot;
 	TransactionId OldestXmin;
+    BlockNumber blocks_done = 0;
+    BlockNumber prev_block = InvalidBlockNumber;
+    BlockNumber prev_nblocks = 0;
 	bool		need_unregister_snapshot = false;
 
     if (start_blockno != 0 || numblocks != InvalidBlockNumber)
@@ -1248,7 +1217,8 @@ cryo_index_build_range_scan(Relation rel,
     /* Publish the number of blocks to scan */
     if (progress)
     {
-        /* TODO */
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_TOTAL,
+                                     ((CryoScanDesc) scan)->nblocks);
     }
     
     reltuples = 0;
@@ -1264,7 +1234,20 @@ cryo_index_build_range_scan(Relation rel,
         /* Report scan progress, if asked to. */
         if (progress)
         {
-            /* TODO */
+            CryoScanDesc cscan = (CryoScanDesc) scan;
+
+            if (cscan->cur_block != prev_block)
+            {
+                /*
+                 * Rough estimation of processed blocks number. Note that it
+                 * doesn't count empty/uncommited blocks.
+                 */
+                Assert(cscan->cacheEntry != InvalidCacheEntry);
+                blocks_done += prev_nblocks;
+                prev_block = cscan->cur_block;
+                prev_nblocks = cryo_cache_get_pg_nblocks(cscan->cacheEntry);
+                pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE, blocks_done);
+            }
         }
 
         reltuples += 1;
@@ -1298,9 +1281,11 @@ cryo_index_build_range_scan(Relation rel,
 #endif
     }
 
+    /* Report scan progress one last time. */
     if (progress)
     {
-        /* TODO */
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE,
+                                     ((CryoScanDesc) scan)->nblocks);
     }
 	table_endscan(scan);
 
