@@ -85,36 +85,60 @@ index_get_bitmap(Relation irel, Oid atttype, Oid valtype, Datum val, int strateg
     return tbm;
 }
 
+static int
+bt_strategy_negator(int strategy)
+{
+    switch (strategy)
+    {
+        case BTLessStrategyNumber:
+            return BTGreaterEqualStrategyNumber;
+        case BTLessEqualStrategyNumber:
+            return BTGreaterStrategyNumber;
+        case BTGreaterStrategyNumber:
+            return BTLessEqualStrategyNumber;
+        case BTGreaterEqualStrategyNumber:
+            return BTLessStrategyNumber;
+        default:
+            Assert(false && "unsupported strategy");
+    }
+}
+
+/*
+ * index_extract_tids
+ *      Return TIDBitmap of items corresponding to the predicate defined by
+ *      strategy and value (e.g. <5, >'2020-01-01' etc) extracted from index.
+ *      Blocks that may contain tuples other than those in said bitmap
+ *      (i.e. border blocks) are stored in `blocks` array.
+ */
 static TIDBitmap *
-index_extract_tids(Relation irel, Datum val, Oid valtype,
+index_extract_tids(Relation irel, Datum val, Oid valtype, int strategy,
                    BlockNumber **blocks, int *nblocks)
 {
-    int         strategy = BTLessStrategyNumber;
     AttrNumber  attno = 1;
     TupleDesc   tupdesc;
     Oid         atttype;
     TypeCacheEntry *tce1, *tce2;
     Oid         opfuncid;
-    TIDBitmap  *tbm_lt, *tbm_ge;
+    TIDBitmap  *tbm1, *tbm2;
     List       *border_blocks = NIL;
 
     tupdesc = RelationGetDescr(irel);
     atttype = TupleDescAttr(tupdesc, attno - 1)->atttypid;
 
-    tbm_lt = index_get_bitmap(irel, atttype, valtype, val, BTLessStrategyNumber);
-    tbm_ge = index_get_bitmap(irel, atttype, valtype, val, BTGreaterEqualStrategyNumber);
+    tbm1 = index_get_bitmap(irel, atttype, valtype, val, strategy);
+    tbm2 = index_get_bitmap(irel, atttype, valtype, val, bt_strategy_negator(strategy));
 
     /*
      * Find blocks on intersection of both bitmaps. Given the comment on
      * tbm_iterate() we assume that block numbers are ordered.
      */
-    if (tbm_lt && tbm_ge)
+    if (tbm1 && tbm2)
     {
         TBMIterator *it1, *it2;
         TBMIterateResult *res1, *res2;
 
-        it1 = tbm_begin_iterate(tbm_lt);
-        it2 = tbm_begin_iterate(tbm_ge);
+        it1 = tbm_begin_iterate(tbm1);
+        it2 = tbm_begin_iterate(tbm2);
 
         res1 = tbm_iterate(it1);
         res2 = tbm_iterate(it2);
@@ -155,7 +179,7 @@ index_extract_tids(Relation irel, Datum val, Oid valtype,
         }
     }
 
-    return tbm_lt;
+    return tbm1;
 }
 
 /*
@@ -349,18 +373,10 @@ drop_blocks(Relation rel, List *blocks)
     FreeSpaceMapVacuum(rel);
 }
 
-/*
- * cryo_purge
- *      Delete blocks containing values less than specified.
- */
-PG_FUNCTION_INFO_V1(cryo_purge);
-Datum
-cryo_purge(PG_FUNCTION_ARGS)
+static void
+cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
+                    int strategy)
 {
-    Oid         relid = PG_GETARG_OID(0);
-    char       *attname = PG_GETARG_CSTRING(1);
-    Datum       val = PG_GETARG_DATUM(2);
-    Oid         valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
     Relation    rel;
     List       *indexlist = NIL;
     ListCell   *lc;
@@ -426,7 +442,7 @@ cryo_purge(PG_FUNCTION_ARGS)
     if (!key_index)
         elog(ERROR, "index for key \"%s\" is not found", attname);
 
-    tbm = index_extract_tids(key_index, val, valtype,
+    tbm = index_extract_tids(key_index, val, valtype, strategy,
                              &border_blocks, &nborder_blocks);
     if (tbm)
     {
@@ -513,4 +529,76 @@ cryo_purge(PG_FUNCTION_ARGS)
     }
 
     relation_close(rel, RowExclusiveLock);
+}
+
+/*
+ * cryo_purge_lt
+ *      Delete blocks containing values less than specified.
+ */
+PG_FUNCTION_INFO_V1(cryo_purge_lt);
+Datum
+cryo_purge_lt(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    char   *attname = PG_GETARG_CSTRING(1);
+    Datum   val = PG_GETARG_DATUM(2);
+    Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+    cryo_purge_internal(relid, attname, val, valtype, BTLessStrategyNumber);
+
+    PG_RETURN_VOID();
+}
+
+/*
+ * cryo_purge_le
+ *      Delete blocks containing values less or equal than specified.
+ */
+PG_FUNCTION_INFO_V1(cryo_purge_le);
+Datum
+cryo_purge_le(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    char   *attname = PG_GETARG_CSTRING(1);
+    Datum   val = PG_GETARG_DATUM(2);
+    Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+    cryo_purge_internal(relid, attname, val, valtype, BTLessEqualStrategyNumber);
+
+    PG_RETURN_VOID();
+}
+
+/*
+ * cryo_purge_gt
+ *      Delete blocks containing values greater than specified.
+ */
+PG_FUNCTION_INFO_V1(cryo_purge_gt);
+Datum
+cryo_purge_gt(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    char   *attname = PG_GETARG_CSTRING(1);
+    Datum   val = PG_GETARG_DATUM(2);
+    Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+    cryo_purge_internal(relid, attname, val, valtype, BTGreaterStrategyNumber);
+
+    PG_RETURN_VOID();
+}
+
+/*
+ * cryo_purge_gt
+ *      Delete blocks containing values greater or equal than specified.
+ */
+PG_FUNCTION_INFO_V1(cryo_purge_ge);
+Datum
+cryo_purge_ge(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    char   *attname = PG_GETARG_CSTRING(1);
+    Datum   val = PG_GETARG_DATUM(2);
+    Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+    cryo_purge_internal(relid, attname, val, valtype, BTGreaterEqualStrategyNumber);
+
+    PG_RETURN_VOID();
 }
