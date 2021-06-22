@@ -12,6 +12,7 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "pg_cryogen.h"
 #include "cache.h"
 #include "storage.h"
 
@@ -82,11 +83,6 @@ index_get_bitmap(Relation irel, Oid atttype, Oid valtype, Datum val, int strateg
     index_endscan(scandesc);
 
     return tbm;
-}
-
-int BlockNumberComparator(const void *a, const void *b)
-{
-    return (*(BlockNumber *) a < *(BlockNumber *) b) ? -1 : 1;
 }
 
 static TIDBitmap *
@@ -380,6 +376,15 @@ cryo_purge(PG_FUNCTION_ARGS)
     int nborder_blocks;
 
     rel = relation_open(relid, RowExclusiveLock);
+
+    /* Does this relation use pg_cryogen as storage? */
+    if (rel->rd_tableam != &CryoAmRoutine)
+    {
+        elog(ERROR,
+             "relation \"%s\" does not use pg_cryogen as storage engine",
+             RelationGetRelationName(rel));
+    }
+
     attnum = attnameAttNum(rel, attname, false);
     indexlist = RelationGetIndexList(rel);
 
@@ -413,12 +418,13 @@ cryo_purge(PG_FUNCTION_ARGS)
         {
             key_index = irel;
 
-            elog(NOTICE, "index found: %s!", RelationGetRelationName(irel));
+            elog(DEBUG1, "use index \"%s\" for the key \"%s\"",
+                 RelationGetRelationName(irel), attname);
         }
     }
 
     if (!key_index)
-        elog(ERROR, "key index not found");
+        elog(ERROR, "index for key \"%s\" is not found", attname);
 
     tbm = index_extract_tids(key_index, val, valtype,
                              &border_blocks, &nborder_blocks);
@@ -455,9 +461,11 @@ cryo_purge(PG_FUNCTION_ARGS)
                 tuples->num_tuples > 0)
             {
                 /* TODO: update index stats */
+                elog(DEBUG1,
+                     "tuples struct at max capacity; cleanup indexes "
+                     "and delete pages");
                 vacuum_indexes(irels, indstats, nindexes, tuples);
                 drop_blocks(rel, dead_blocks);
-                elog(NOTICE, "index_bulk_delete() and drop pages");
                 list_free(dead_blocks);
                 dead_blocks = NIL;
             }
@@ -494,7 +502,7 @@ cryo_purge(PG_FUNCTION_ARGS)
         /* TODO: update index stats */
         vacuum_indexes(irels, indstats, nindexes, tuples);
         drop_blocks(rel, dead_blocks);
-        elog(NOTICE, "final index_bulk_delete() and drop pages");
+        elog(DEBUG1, "final indexes cleanup and pages deletion");
 
         tbm_end_iterate(iter);
     }

@@ -30,6 +30,7 @@
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
+#include "pg_cryogen.h"
 #include "cache.h"
 #include "compression.h"
 #include "scan_iterator.h"
@@ -1397,6 +1398,9 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
     iter = cryo_seqscan_iter_create();
     blkno = cryo_seqscan_iter_next(iter);
 
+    pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
+                                 PROGRESS_VACUUM_PHASE_VACUUM_HEAP);
+
     while (blkno < npages)
     {
         CryoFirstPageHeader *first_page;
@@ -1427,7 +1431,7 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
             /*
              * This is not the first page of the cryo block. Skip it for now,
              * we'll get back to it later.
-             * This is also the case when a page created by non commited
+             * This is also the case when page's created by a non commited
              * transaction was previously vacuumed (i.e. first == next == 0).
              */
             UnlockReleaseBuffer(buf);
@@ -1513,13 +1517,15 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         blkno = cryo_seqscan_iter_next(iter);
     }
 
+	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
+								 PROGRESS_VACUUM_PHASE_FINAL_CLEANUP);
     FreeSpaceMapVacuum(onerel);
 }
 
 /*
  * Defenition of cryo table access method.
  */
-static const TableAmRoutine cryo_methods = 
+const TableAmRoutine CryoAmRoutine = 
 {
     .type = T_TableAmRoutine,
 
@@ -1579,5 +1585,5 @@ static const TableAmRoutine cryo_methods =
 Datum
 cryo_tableam_handler(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_POINTER(&cryo_methods);
+    PG_RETURN_POINTER(&CryoAmRoutine);
 }
