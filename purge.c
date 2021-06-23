@@ -373,7 +373,14 @@ drop_blocks(Relation rel, List *blocks)
     FreeSpaceMapVacuum(rel);
 }
 
-static void
+/*
+ * cryo_purge_internal
+ *      Delete blocks containing values specified by predicate (value and
+ *      strategy). Blocks that may contain values other than those
+ *      corresponding to the predicate are kept intact. Returns the total
+ *      number of tuples deleted.
+ */
+static uint64
 cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
                     int strategy)
 {
@@ -387,9 +394,9 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
     IndexBulkDeleteResult **indstats;
     int         nindexes = 0;
     int         i = 0;
-
+    uint64      total = 0;  /* total number of tuples deleted */
     BlockNumber *border_blocks;
-    int nborder_blocks;
+    int         nborder_blocks;
 
     rel = relation_open(relid, RowExclusiveLock);
 
@@ -503,6 +510,7 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
                 while (item * sizeof(CryoItemId) < hdr->lower)
                 {
                     tidlist_record_item(tuples, tbmres->blockno, item++);
+                    total++;
                 }
             }
             else
@@ -510,6 +518,7 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
                 for (int i = 0; i < tbmres->ntuples; ++i)
                 {
                     tidlist_record_item(tuples, tbmres->blockno, tbmres->offsets[i]);
+                    total++;
                 }
             }
             dead_blocks = lappend_int(dead_blocks, tbmres->blockno);
@@ -529,6 +538,8 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
     }
 
     relation_close(rel, RowExclusiveLock);
+
+    return total;
 }
 
 /*
@@ -543,10 +554,11 @@ cryo_purge_lt(PG_FUNCTION_ARGS)
     char   *attname = PG_GETARG_CSTRING(1);
     Datum   val = PG_GETARG_DATUM(2);
     Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+    uint64  res;
 
-    cryo_purge_internal(relid, attname, val, valtype, BTLessStrategyNumber);
+    res = cryo_purge_internal(relid, attname, val, valtype, BTLessStrategyNumber);
 
-    PG_RETURN_VOID();
+    PG_RETURN_UINT64(res);
 }
 
 /*
@@ -561,10 +573,12 @@ cryo_purge_le(PG_FUNCTION_ARGS)
     char   *attname = PG_GETARG_CSTRING(1);
     Datum   val = PG_GETARG_DATUM(2);
     Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+    uint64  res;
 
-    cryo_purge_internal(relid, attname, val, valtype, BTLessEqualStrategyNumber);
+    res = cryo_purge_internal(relid, attname, val, valtype,
+                              BTLessEqualStrategyNumber);
 
-    PG_RETURN_VOID();
+    PG_RETURN_UINT64(res);
 }
 
 /*
@@ -579,10 +593,12 @@ cryo_purge_gt(PG_FUNCTION_ARGS)
     char   *attname = PG_GETARG_CSTRING(1);
     Datum   val = PG_GETARG_DATUM(2);
     Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+    uint64  res;
 
-    cryo_purge_internal(relid, attname, val, valtype, BTGreaterStrategyNumber);
+    res = cryo_purge_internal(relid, attname, val, valtype,
+                              BTGreaterStrategyNumber);
 
-    PG_RETURN_VOID();
+    PG_RETURN_UINT64(res);
 }
 
 /*
@@ -597,8 +613,10 @@ cryo_purge_ge(PG_FUNCTION_ARGS)
     char   *attname = PG_GETARG_CSTRING(1);
     Datum   val = PG_GETARG_DATUM(2);
     Oid     valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+    uint64  res;
 
-    cryo_purge_internal(relid, attname, val, valtype, BTGreaterEqualStrategyNumber);
+    res = cryo_purge_internal(relid, attname, val, valtype,
+                              BTGreaterEqualStrategyNumber);
 
-    PG_RETURN_VOID();
+    PG_RETURN_UINT64(res);
 }
