@@ -229,7 +229,7 @@ cryo_beginscan(Relation relation, Snapshot snapshot,
     return (TableScanDesc) scan;
 }
 
-static bool
+bool
 xid_is_visible(Snapshot snapshot, TransactionId xid)
 {
     switch (snapshot->snapshot_type)
@@ -1054,7 +1054,6 @@ cryo_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
     buf = ReadBuffer(cscan->rs_base.rs_rd, blockno);
     LockBuffer(buf, BUFFER_LOCK_SHARE);
     page = (CryoPageHeader *) BufferGetPage(buf);
-    //blockno = blockno - page->curpage;
     blockno = page->first;
     UnlockReleaseBuffer(buf);
 

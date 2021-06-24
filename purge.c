@@ -505,6 +505,13 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
                 int         item = 1;
 
                 err = cryo_read_data(rel, NULL, tbmres->blockno, &cacheEntry);
+                if (err != CRYO_ERR_SUCCESS)
+                    elog(ERROR, cryo_cache_err(err));
+
+                if (!xid_is_visible(GetLatestSnapshot(),
+                                    cryo_cache_get_xid(cacheEntry)))
+                    continue;
+
                 hdr = (CryoDataHeader *) cryo_cache_get_data(cacheEntry);
 
                 while (item * sizeof(CryoItemId) < hdr->lower)
@@ -515,6 +522,18 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
             }
             else
             {
+                /* Skip blocks created by rolled back transaction */
+                Buffer buf = ReadBuffer(rel, tbmres->blockno);
+                CryoFirstPageHeader *first_page = BufferGetPage(buf);
+
+                LockBuffer(buf, BUFFER_LOCK_SHARE);
+                if (!xid_is_visible(GetLatestSnapshot(), first_page->created_xid))
+                {
+                    UnlockReleaseBuffer(buf);
+                    continue;
+                }
+                UnlockReleaseBuffer(buf);
+
                 for (int i = 0; i < tbmres->ntuples; ++i)
                 {
                     tidlist_record_item(tuples, tbmres->blockno, tbmres->offsets[i]);
