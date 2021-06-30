@@ -33,6 +33,7 @@
 #include "pg_cryogen.h"
 #include "cache.h"
 #include "compression.h"
+#include "purge.h"
 #include "scan_iterator.h"
 #include "storage.h"
 
@@ -1374,25 +1375,18 @@ cryo_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 }
 
 static void
-cryo_vacuum_rel(Relation onerel, VacuumParams *params,
-                BufferAccessStrategy bstrategy)
+cryo_vacuum_scan_rel(Relation onerel, Relation *irels, int nindexes,
+                     TransactionId freeze_limit)
 {
-    int         npages = RelationGetNumberOfBlocks(onerel);
+    int             npages = RelationGetNumberOfBlocks(onerel);
     BlockNumber     blkno;
-    TransactionId   oldest_xmin, freeze_limit, xid_full_scan_limit;
-    MultiXactId     multi_xact_cutoff, multi_xact_full_scan_limit;
     SeqScanIterator *iter;
+    IndexBulkDeleteResult **indstats;
+    TIDList        *tuples;
+    List           *dead_blocks = NIL;
 
-    if (params->options & VACOPT_FULL)
-        elog(ERROR, "pg_cryogen: VACUUM FULL is not implemented");
-
-    vacuum_set_xid_limits(onerel,
-                          params->freeze_min_age,
-                          params->freeze_table_age,
-                          params->multixact_freeze_min_age,
-                          params->multixact_freeze_table_age,
-                          &oldest_xmin, &freeze_limit, &xid_full_scan_limit,
-                          &multi_xact_cutoff, &multi_xact_full_scan_limit);
+    indstats = (IndexBulkDeleteResult **)
+        palloc0(nindexes * sizeof(IndexBulkDeleteResult *));
 
     iter = cryo_seqscan_iter_create();
     blkno = cryo_seqscan_iter_next(iter);
@@ -1400,6 +1394,9 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
     pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
                                  PROGRESS_VACUUM_PHASE_VACUUM_HEAP);
 
+    tuples = tidlist_alloc(RelationGetNumberOfBlocks(onerel));
+
+    /* Scan relation */
     while (blkno < npages)
     {
         CryoFirstPageHeader *first_page;
@@ -1407,12 +1404,11 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         Buffer      buf;
         Buffer      vmbuf = InvalidBuffer;
         uint8       vmflags;
-        bool        commited;
+        bool        is_dead;
         int         nblocks;
         int         i;
 
         buf = ReadBuffer(onerel, blkno);
-        LockBufferForCleanup(buf);
         first_page = (CryoFirstPageHeader *) BufferGetPage(buf);
         page = (CryoPageHeader *) first_page;
 
@@ -1420,7 +1416,7 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         if (PageIsNew(first_page) || CryoPageIsEmpty(first_page))
         {
             RecordPageWithFreeSpace(onerel, blkno, BLCKSZ - sizeof(CryoPageHeader));
-            UnlockReleaseBuffer(buf);
+            ReleaseBuffer(buf);
             blkno = cryo_seqscan_iter_next(iter);
             continue;
         }
@@ -1433,7 +1429,7 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
              * This is also the case when page's created by a non commited
              * transaction was previously vacuumed (i.e. first == next == 0).
              */
-            UnlockReleaseBuffer(buf);
+            ReleaseBuffer(buf);
             blkno = cryo_seqscan_iter_next(iter);
             continue;
         }
@@ -1442,8 +1438,8 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
          * If transaction did not commit and not in progress we consider the
          * corresponding pages eligable for deletion
          */
-        commited = TransactionIdDidCommit(first_page->created_xid) ||
-            TransactionIdIsInProgress(first_page->created_xid);
+        is_dead = !TransactionIdDidCommit(first_page->created_xid) &&
+            !TransactionIdIsInProgress(first_page->created_xid);
 
         vmflags = visibilitymap_get_status(onerel, blkno, &vmbuf);
         if (!(vmflags & VISIBILITYMAP_ALL_FROZEN))
@@ -1465,56 +1461,103 @@ cryo_vacuum_rel(Relation onerel, VacuumParams *params,
         }
 
         nblocks = first_page->npages;
-        Buffer *buffers = palloc0(sizeof(Buffer) * nblocks);
 
-        /*
-         * Mark the rest pages as read. Not optimal way to do it, but the only
-         * solution I came up with so far.
-         */
-        buffers[0] = buf;
-        for (i = 1; i < nblocks; ++i)
+        if (is_dead && nindexes > 0)
         {
-            if (!BlockNumberIsValid(page->next))
-                elog(ERROR, "unexpected page chain end");
+            CryoError       err;
+            CacheEntry      cacheEntry;
 
-            buffers[i] = ReadBuffer(onerel, page->next);
-            LockBufferForCleanup(buffers[i]);
-            page = (CryoPageHeader *) BufferGetPage(buffers[i]);
-        }
-
-        for (i = 0; i < nblocks; ++i)
-        {
-            if (!commited)
+            err = cryo_read_data(onerel, iter, blkno, &cacheEntry);
+            if (err == CRYO_ERR_SUCCESS)
             {
-                GenericXLogState *xlogState = GenericXLogStart(onerel);
+                CryoDataHeader *hdr;
+                int item = 1;
 
-                blkno = BufferGetBlockNumber(buffers[i]);
+                /* Did tuples struct reach max capacity? */
+                if ((tuples->max_tuples - tuples->num_tuples) < MaxHeapTuplesPerPage &&
+                    tuples->num_tuples > 0)
+                {
+                    /* TODO: update index stats */
+                    elog(DEBUG1,
+                         "tuples struct at max capacity; cleanup indexes");
 
-                page = (CryoPageHeader *)
-                    GenericXLogRegisterBuffer(xlogState, buffers[i], GENERIC_XLOG_FULL_IMAGE);
-                page->first = page->next = 0;
-                page->base.pd_upper = BLCKSZ;
-                page->base.pd_lower = sizeof(CryoMetaPage);
-                page->base.pd_special = BLCKSZ;
-                PageSetChecksumInplace((Page) page, blkno);
-                GenericXLogFinish(xlogState);                
+                    /* Cleanup indexes */
+                    vacuum_indexes(irels, indstats, nindexes, tuples);
+                    tuples->num_tuples = 0;
 
-                RecordPageWithFreeSpace(onerel, BufferGetBlockNumber(buffers[i]),
-                                        BLCKSZ - sizeof(CryoPageHeader));
+                    /* Zero corresponding blocks */
+                    drop_blocks(onerel, dead_blocks);
+                    dead_blocks = NIL;
+                }
+
+                hdr = (CryoDataHeader *) cryo_cache_get_data(cacheEntry);
+
+                while (item * sizeof(CryoItemId) < hdr->lower)
+                    tidlist_record_item(tuples, blkno, item++);
+
+                /* Mark block dead */
+                dead_blocks = lappend_int(dead_blocks, blkno);
             }
-
-            if (i != 0)
-                cryo_seqscan_iter_exclude(iter, BufferGetBlockNumber(buffers[i]), false);
-
-            UnlockReleaseBuffer(buffers[i]);
         }
-        pfree(buffers);
+        else
+        {
+            /* If page is dead add it to the list for further zeroing */
+            if (is_dead)
+                dead_blocks = lappend_int(dead_blocks, blkno);
+
+            /* Skip the rest of pages */
+            for (i = 1; i < nblocks; ++i)
+            {
+                Buffer prev_buf = buf;
+
+                if (!BlockNumberIsValid(page->next))
+                    elog(ERROR, "unexpected page chain end");
+                buf = ReadBuffer(onerel, page->next);
+                ReleaseBuffer(prev_buf);
+                page = (CryoPageHeader *) BufferGetPage(buf);
+                cryo_seqscan_iter_exclude(iter, BufferGetBlockNumber(buf), false);
+            }
+        }
+        ReleaseBuffer(buf);
 
         if (BufferIsValid(vmbuf))
             ReleaseBuffer(vmbuf);
 
         blkno = cryo_seqscan_iter_next(iter);
     }
+
+    if (tuples->num_tuples > 0)
+    {
+        elog(DEBUG1, "final indexes cleanup");
+        vacuum_indexes(irels, indstats, nindexes, tuples);
+    }
+    if (dead_blocks)
+        drop_blocks(onerel, dead_blocks);
+}
+
+static void
+cryo_vacuum_rel(Relation onerel, VacuumParams *params,
+                BufferAccessStrategy bstrategy)
+{
+    TransactionId   oldest_xmin, freeze_limit, xid_full_scan_limit;
+    MultiXactId     multi_xact_cutoff, multi_xact_full_scan_limit;
+    Relation       *irels;
+    int             nindexes = 0;
+
+    if (params->options & VACOPT_FULL)
+        elog(ERROR, "pg_cryogen: VACUUM FULL is not implemented");
+
+    vacuum_set_xid_limits(onerel,
+                          params->freeze_min_age,
+                          params->freeze_table_age,
+                          params->multixact_freeze_min_age,
+                          params->multixact_freeze_table_age,
+                          &oldest_xmin, &freeze_limit, &xid_full_scan_limit,
+                          &multi_xact_cutoff, &multi_xact_full_scan_limit);
+
+    vac_open_indexes(onerel, RowExclusiveLock, &nindexes, &irels);
+    cryo_vacuum_scan_rel(onerel, irels, nindexes, freeze_limit);
+    vac_close_indexes(nindexes, irels, NoLock);
 
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
 								 PROGRESS_VACUUM_PHASE_FINAL_CLEANUP);

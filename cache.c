@@ -408,7 +408,7 @@ cryo_cache_get_pg_nblocks(CacheEntry entry)
     return cache[entry].nblocks;
 }
 
-char *
+const char *
 cryo_cache_get_data(CacheEntry entry)
 {
     CacheEntryHeader *header = &cache[entry];

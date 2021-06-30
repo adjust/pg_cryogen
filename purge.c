@@ -14,6 +14,7 @@
 
 #include "pg_cryogen.h"
 #include "cache.h"
+#include "purge.h"
 #include "storage.h"
 
 
@@ -23,14 +24,6 @@
 #define SizeOfDeadTuples(cnt) \
 	add_size(offsetof(TIDList, itemptrs), \
 			 mul_size(sizeof(ItemPointerData), cnt))
-
-
-typedef struct TIDList
-{
-	int			max_tuples;		/* # slots allocated in array */
-	int			num_tuples;		/* current # of entries */
-	ItemPointerData itemptrs[FLEXIBLE_ARRAY_MEMBER];
-} TIDList;
 
 
 static TIDBitmap *
@@ -212,7 +205,7 @@ compute_max_tuples(BlockNumber relblocks, bool useindex)
 	return maxtuples;
 }
 
-static TIDList *
+TIDList *
 tidlist_alloc(BlockNumber relblocks)
 {
     TIDList    *tuples = NULL;
@@ -227,7 +220,7 @@ tidlist_alloc(BlockNumber relblocks)
     return tuples;
 }
 
-static void
+void
 tidlist_record_item(TIDList *tuples, BlockNumber blockno, OffsetNumber offset)
 {
     /*
@@ -293,9 +286,9 @@ tid_reaped(ItemPointer itemptr, void *state)
 	return (res != NULL);
 }
 
-static void
+void
 vacuum_indexes(Relation *irels, IndexBulkDeleteResult **stats,
-                    int nindexes, TIDList *tuples)
+               int nindexes, TIDList *tuples)
 {
     for (int i = 0; i < nindexes; ++i)
     {
@@ -313,7 +306,7 @@ vacuum_indexes(Relation *irels, IndexBulkDeleteResult **stats,
     }
 }
 
-static void
+void
 drop_blocks(Relation rel, List *blocks)
 {
     ListCell *lc;
@@ -459,7 +452,7 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
         List           *dead_blocks = NIL;
         
         tuples = tidlist_alloc(RelationGetNumberOfBlocks(rel));
-        
+
         iter = tbm_begin_iterate(tbm);
 
         while((tbmres = tbm_iterate(iter)) != NULL)
@@ -491,6 +484,7 @@ cryo_purge_internal(Oid relid, const char *attname, Datum val, Oid valtype,
                 drop_blocks(rel, dead_blocks);
                 list_free(dead_blocks);
                 dead_blocks = NIL;
+                tuples->num_tuples = 0;
             }
 
             /*
