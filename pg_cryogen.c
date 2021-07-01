@@ -1405,6 +1405,7 @@ cryo_vacuum_scan_rel(Relation onerel, Relation *irels, int nindexes,
         Buffer      vmbuf = InvalidBuffer;
         uint8       vmflags;
         bool        is_dead;
+        bool        needs_freeze = false;
         int         nblocks;
         int         i;
 
@@ -1446,6 +1447,8 @@ cryo_vacuum_scan_rel(Relation onerel, Relation *irels, int nindexes,
         {
             if (TransactionIdPrecedes(first_page->created_xid, freeze_limit))
             {
+                needs_freeze = true;
+
                 /* Freeze page by setting bit in visibility map */ 
                 visibilitymap_pin(onerel, blkno, &vmbuf);
 
@@ -1504,6 +1507,27 @@ cryo_vacuum_scan_rel(Relation onerel, Relation *irels, int nindexes,
             /* If page is dead add it to the list for further zeroing */
             if (is_dead)
                 dead_blocks = lappend_int(dead_blocks, blkno);
+
+            /*
+             * Set created_xid to FrozenTransactionId if block needs to be
+             * frozen.
+             */
+            if (needs_freeze)
+            {
+                CryoFirstPageHeader *p;
+                GenericXLogState    *xlogState;
+
+                LockBufferForCleanup(buf);
+                xlogState = GenericXLogStart(onerel);
+
+                p = (CryoFirstPageHeader *)
+                    GenericXLogRegisterBuffer(xlogState, buf, 0);
+                p->created_xid = FrozenTransactionId;
+                PageSetChecksumInplace((Page) page, blkno);
+
+                GenericXLogFinish(xlogState);
+                LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            }
 
             /* Skip the rest of pages */
             for (i = 1; i < nblocks; ++i)
