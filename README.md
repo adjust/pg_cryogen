@@ -1,3 +1,5 @@
+[![CI](https://github.com/adjust/pg_cryogen/actions/workflows/main.yml/badge.svg)](https://github.com/adjust/pg_cryogen/actions/workflows/main.yml)
+
 [![Build Status](https://travis-ci.org/adjust/pg_cryogen.svg?branch=master)](https://travis-ci.org/adjust/pg_cryogen) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
 # pg_cryogen
